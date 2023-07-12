@@ -2,12 +2,14 @@ from transformers import AutoModel, AutoTokenizer
 import gradio as gr
 import mdtex2html
 
+import habana_frameworks.torch as ht
 import habana_frameworks.torch.core as htcore
 import habana_frameworks.torch.gpu_migration
 
 tokenizer = AutoTokenizer.from_pretrained("THUDM/chatglm-6b", trust_remote_code=True)
 model = AutoModel.from_pretrained("THUDM/chatglm-6b", trust_remote_code=True).half().cuda()
 model = model.eval()
+model = ht.hpu.wrap_in_hpu_graph(model)
 
 """Override Chatbot.postprocess"""
 

@@ -4,12 +4,14 @@ import signal
 from transformers import AutoTokenizer, AutoModel
 import readline
 
+import habana_frameworks.torch as ht
 import habana_frameworks.torch.core as htcore
 import habana_frameworks.torch.gpu_migration
 
 tokenizer = AutoTokenizer.from_pretrained("THUDM/chatglm-6b", trust_remote_code=True)
 model = AutoModel.from_pretrained("THUDM/chatglm-6b", trust_remote_code=True).half().cuda()
 model = model.eval()
+model = ht.hpu.wrap_in_hpu_graph(model)
 
 os_name = platform.system()
 clear_command = 'cls' if os_name == 'Windows' else 'clear'
