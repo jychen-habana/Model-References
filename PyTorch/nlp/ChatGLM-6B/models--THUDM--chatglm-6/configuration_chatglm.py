@@ -95,6 +95,9 @@ class ChatGLMConfig(PretrainedConfig):
         self.pre_seq_len = pre_seq_len
         self.prefix_projection = prefix_projection
 
+        # [HPU] options for static shapes
+        self.static_shapes = True
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

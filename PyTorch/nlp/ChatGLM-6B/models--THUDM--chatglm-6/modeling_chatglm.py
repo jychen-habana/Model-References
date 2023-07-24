@@ -51,6 +51,18 @@ CHATGLM_6B_PRETRAINED_MODEL_ARCHIVE_LIST = [
 ]
 
 
+def defined(v):
+    return v is not None
+
+
+def calculate_input_padding(input_length, static_shapes=False, max_input_length=None):
+    if not static_shapes:
+        return 0
+    if defined(max_input_length):
+        return max_input_length - input_length
+    assert False, "Running with static_shapes requires setting 'max_input_length'"
+
+
 class InvalidScoreLogitsProcessor(LogitsProcessor):
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         if torch.isnan(scores).any() or torch.isinf(scores).any():
@@ -250,12 +262,18 @@ def attention_fn(
         layer_past=None,
         scaling_attention_score=True,
         use_cache=False,
+        token_idx=None,
 ):
     if layer_past is not None:
         past_key, past_value = layer_past[0], layer_past[1]
-        key_layer = torch.cat((past_key, key_layer), dim=0)
-        value_layer = torch.cat((past_value, value_layer), dim=0)
-
+        if token_idx is None:
+            key_layer = torch.cat((past_key, key_layer), dim=0)
+            value_layer = torch.cat((past_value, value_layer), dim=0)
+        else:
+            past_key.index_copy_(0, token_idx - 1, key_layer)
+            past_value.index_copy_(0, token_idx - 1, value_layer)
+            key_layer = past_key
+            value_layer = past_value
     # seqlen, batch, num_attention_heads, hidden_size_per_attention_head
     seq_len, b, nh, hidden_size = key_layer.shape
 
@@ -435,6 +453,7 @@ class SelfAttention(torch.nn.Module):
             layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
             use_cache: bool = False,
             output_attentions: bool = False,
+            token_idx: Optional[torch.Tensor] = None
     ):
         """
         hidden_states: [seq_len, batch, hidden_size]
@@ -457,7 +476,11 @@ class SelfAttention(torch.nn.Module):
         if self.position_encoding_2d:
             q1, q2 = query_layer.chunk(2, dim=(query_layer.ndim - 1))
             k1, k2 = key_layer.chunk(2, dim=(key_layer.ndim - 1))
-            cos, sin = self.rotary_emb(q1, seq_len=position_ids.max() + 1)
+            # [HPU]
+            if token_idx is None:
+                cos, sin = self.rotary_emb(q1, seq_len=position_ids.max() + 1)
+            else:
+                cos, sin = self.rotary_emb(q1, seq_len=2048)
             position_ids, block_position_ids = position_ids[:, 0, :].transpose(0, 1).contiguous(), \
                 position_ids[:, 1, :].transpose(0, 1).contiguous()
             q1, k1 = apply_rotary_pos_emb_index(q1, k1, cos, sin, position_ids)
@@ -480,7 +503,8 @@ class SelfAttention(torch.nn.Module):
             hidden_size_per_partition=self.hidden_size_per_partition,
             layer_id=layer_id,
             layer_past=layer_past,
-            use_cache=use_cache
+            use_cache=use_cache,
+            token_idx=token_idx
         )
 
         output = self.dense(context_layer)
@@ -613,6 +637,7 @@ class GLMBlock(torch.nn.Module):
             layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
             use_cache: bool = False,
             output_attentions: bool = False,
+            token_idx: Optional[torch.Tensor] = None
     ):
         """
         hidden_states: [seq_len, batch, hidden_size]
@@ -631,7 +656,8 @@ class GLMBlock(torch.nn.Module):
             layer_id=layer_id,
             layer_past=layer_past,
             use_cache=use_cache,
-            output_attentions=output_attentions
+            output_attentions=output_attentions,
+            token_idx=token_idx
         )
 
         attention_output = attention_outputs[0]
@@ -896,6 +922,7 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
             use_cache: Optional[bool] = None,
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
+            token_idx: Optional[torch.Tensor] = None,
             return_dict: Optional[bool] = None,
     ) -> Union[Tuple[torch.Tensor, ...], BaseModelOutputWithPast]:
 
@@ -1000,7 +1027,8 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
                     layer_id=torch.tensor(i),
                     layer_past=layer_past,
                     use_cache=use_cache,
-                    output_attentions=output_attentions
+                    output_attentions=output_attentions,
+                    token_idx=token_idx
                 )
 
             hidden_states = layer_ret[0]
@@ -1081,14 +1109,16 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         # update attention mask
         if "attention_mask" in model_kwargs:
             attention_mask = model_kwargs["attention_mask"]
-            if attention_mask is not None and attention_mask.dtype == torch.bool:
-                attention_mask = torch.cat(
-                    [attention_mask, attention_mask.new_ones((*attention_mask.shape[:3], 1))], dim=3)
-                new_attention_mask = attention_mask[:, :, -1:].clone()
-                new_attention_mask[..., -1] = False
-                model_kwargs["attention_mask"] = torch.cat(
-                    [attention_mask, new_attention_mask], dim=2
-                )
+            # [HPU]
+            if "token_idx" not in model_kwargs:
+                if attention_mask is not None and attention_mask.dtype == torch.bool:
+                    attention_mask = torch.cat(
+                        [attention_mask, attention_mask.new_ones((*attention_mask.shape[:3], 1))], dim=3)
+                    new_attention_mask = attention_mask[:, :, -1:].clone()
+                    new_attention_mask[..., -1] = False
+                    model_kwargs["attention_mask"] = torch.cat(
+                        [attention_mask, new_attention_mask], dim=2
+                    )
 
         # update position ids
         if "position_ids" in model_kwargs:
@@ -1108,6 +1138,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             past_key_values: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
             position_ids: Optional[torch.Tensor] = None,
+            token_idx: Optional[torch.Tensor] = None,
             **kwargs
     ) -> dict:
         batch_size, seq_length = input_ids.shape
@@ -1122,19 +1153,33 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
 
         # only last token for input_ids if past is not None
         if past is not None or past_key_values is not None:
-            last_token = input_ids[:, -1].unsqueeze(-1)
-            if attention_mask is not None and attention_mask.dtype == torch.bool:
-                attention_mask = attention_mask[:, :, -1:]
+            # [HPU]
+            if token_idx is None:
+                last_token = input_ids[:, -1].unsqueeze(-1)
+                if attention_mask is not None and attention_mask.dtype == torch.bool:
+                    attention_mask = attention_mask[:, :, -1:]
+                else:
+                    attention_mask = None
             else:
-                attention_mask = None
+                last_token = input_ids.index_select(1, token_idx - 1)
+                if attention_mask is not None and attention_mask.dtype == torch.bool:
+                    attention_mask = attention_mask
+                else:
+                    attention_mask = None
             if position_ids is not None:
                 position_ids = position_ids[..., -1:]
             else:
                 context_lengths = [seq.index(self.config.bos_token_id) for seq in seqs]
                 if self.position_encoding_2d:
-                    position_ids = torch.tensor(
-                        [[mask_position, seq_length - context_length] for mask_position, context_length in
-                         zip(mask_positions, context_lengths)], dtype=torch.long, device=input_ids.device).unsqueeze(-1)
+                    # [HPU]
+                    if token_idx is None:
+                        position_ids = torch.tensor(
+                            [[mask_position, seq_length - context_length] for mask_position, context_length in
+                            zip(mask_positions, context_lengths)], dtype=torch.long, device=input_ids.device).unsqueeze(-1)
+                    else:
+                        position_ids = torch.tensor(
+                            [[mask_position, token_idx - context_length] for mask_position, context_length in
+                            zip(mask_positions, context_lengths)], dtype=torch.long, device=input_ids.device).unsqueeze(-1)
                 else:
                     position_ids = torch.tensor([mask_position for mask_position in mask_positions], dtype=torch.long,
                                                 device=input_ids.device).unsqueeze(-1)
@@ -1145,7 +1190,8 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 "input_ids": last_token,
                 "past_key_values": past,
                 "position_ids": position_ids,
-                "attention_mask": attention_mask
+                "attention_mask": attention_mask,
+                "token_idx": token_idx
             }
         else:
             if attention_mask is not None and attention_mask.dtype != torch.bool:
@@ -1156,6 +1202,12 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                     input_ids,
                     device=input_ids.device
                 )
+            # [HPU]
+            if self.config.static_shapes:
+                input_padding = calculate_input_padding(seq_length, self.config.static_shapes, self.max_sequence_length)
+                token_idx = torch.tensor(seq_length)
+                input_ids = F.pad(input_ids, (0, input_padding), value=self.config.pad_token_id)
+                attention_mask = F.pad(attention_mask, (0, input_padding, 0, input_padding), value=True)
             if position_ids is None:
                 position_ids = self.get_position_ids(
                     input_ids,
@@ -1168,7 +1220,8 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 "input_ids": input_ids,
                 "past_key_values": past,
                 "position_ids": position_ids,
-                "attention_mask": attention_mask
+                "attention_mask": attention_mask,
+                "token_idx": token_idx
             }
 
     def forward(
@@ -1182,6 +1235,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             use_cache: Optional[bool] = None,
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
+            token_idx: Optional[torch.Tensor] = None,
             return_dict: Optional[bool] = None,
     ):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
@@ -1196,6 +1250,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            token_idx=token_idx,
             return_dict=return_dict,
         )
 
@@ -1382,6 +1437,8 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
 
         unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
         scores = None
+
+        first_run = True
         while True:
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             # forward pass to get next token
@@ -1392,7 +1449,14 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 output_hidden_states=False,
             )
 
-            next_token_logits = outputs.logits[:, -1, :]
+            # [HPU]
+            token_idx = model_inputs["token_idx"]
+            if first_run and token_idx is not None:
+                input_ids = model_inputs["input_ids"]
+                next_token_logits = outputs.logits.index_select(-2, token_idx - 1).squeeze(-2)
+                first_run = False
+            else:
+                next_token_logits = outputs.logits[:, -1, :]
 
             # pre-process distribution
             next_token_scores = logits_processor(input_ids, next_token_logits)
@@ -1406,15 +1470,33 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 next_tokens = torch.argmax(probs, dim=-1)
 
             # update generated ids, model inputs, and length for next step
-            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            # [HPU]
+            if token_idx is None:
+                input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            else:
+                input_ids.index_copy_(1, token_idx, next_tokens[:, None])
+                token_idx = token_idx + 1
+                attention_mask = torch.ones(1, self.max_sequence_length).bool()
+                attention_mask[:, :token_idx.int()] = False
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )
+            # [HPU]
+            if token_idx is not None:
+                model_kwargs["token_idx"] = token_idx
+                model_kwargs["attention_mask"] = attention_mask
             unfinished_sequences = unfinished_sequences.mul((sum(next_tokens != i for i in eos_token_id)).long())
 
             # stop when each sentence is finished, or if we exceed the maximum length
-            if unfinished_sequences.max() == 0 or stopping_criteria(input_ids, scores):
-                break
+            # [HPU]
+            if token_idx is None:
+                if unfinished_sequences.max() == 0 or stopping_criteria(input_ids, scores):
+                    break
+            else:
+                if unfinished_sequences.max() == 0 or token_idx.int() >= generation_config.max_length:
+                    break
+            # [HPU]
+            # yield input_ids if token_idx is None else input_ids[:token_idx.int()]
             yield input_ids
 
     def quantize(self, bits: int, empty_init=False, **kwargs):
