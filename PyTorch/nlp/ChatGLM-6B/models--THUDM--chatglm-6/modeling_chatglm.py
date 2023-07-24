@@ -1163,7 +1163,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             else:
                 last_token = input_ids.index_select(1, token_idx - 1)
                 if attention_mask is not None and attention_mask.dtype == torch.bool:
-                    attention_mask = attention_mask
+                    attention_mask.index_fill_(-1, token_idx-1, False)
                 else:
                     attention_mask = None
             if position_ids is not None:
@@ -1202,12 +1202,6 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                     input_ids,
                     device=input_ids.device
                 )
-            # [HPU]
-            if self.config.static_shapes:
-                input_padding = calculate_input_padding(seq_length, self.config.static_shapes, self.max_sequence_length)
-                token_idx = torch.tensor(seq_length)
-                input_ids = F.pad(input_ids, (0, input_padding), value=self.config.pad_token_id)
-                attention_mask = F.pad(attention_mask, (0, input_padding, 0, input_padding), value=True)
             if position_ids is None:
                 position_ids = self.get_position_ids(
                     input_ids,
@@ -1215,6 +1209,13 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                     mask_positions=mask_positions,
                     use_gmasks=use_gmasks
                 )
+            # [HPU]
+            if self.config.static_shapes:
+                input_padding = calculate_input_padding(seq_length, self.config.static_shapes, self.max_sequence_length)
+                token_idx = torch.tensor(seq_length, device=input_ids.device)
+                input_ids = F.pad(input_ids, (0, input_padding), value=self.config.pad_token_id)
+                attention_mask = F.pad(attention_mask, (0, input_padding, 0, input_padding), value=True)
+                position_ids = torch.nn.functional.pad(position_ids, (0, input_padding), value=0)
 
             return {
                 "input_ids": input_ids,
@@ -1437,8 +1438,8 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
 
         unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
         scores = None
-
         first_run = True
+
         while True:
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             # forward pass to get next token
@@ -1450,10 +1451,11 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             )
 
             # [HPU]
-            token_idx = model_inputs["token_idx"]
+            token_idx = model_inputs['token_idx']
             if first_run and token_idx is not None:
                 input_ids = model_inputs["input_ids"]
                 next_token_logits = outputs.logits.index_select(-2, token_idx - 1).squeeze(-2)
+                model_inputs['attention_mask'] = model_inputs['attention_mask'].index_select(2, token_idx - 1)
                 first_run = False
             else:
                 next_token_logits = outputs.logits[:, -1, :]
@@ -1475,16 +1477,12 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
             else:
                 input_ids.index_copy_(1, token_idx, next_tokens[:, None])
-                token_idx = token_idx + 1
-                attention_mask = torch.ones(1, self.max_sequence_length).bool()
-                attention_mask[:, :token_idx.int()] = False
+                token_idx.add_(1)
+                model_kwargs['token_idx'] = token_idx
+                model_kwargs['attention_mask'] = model_inputs['attention_mask']
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )
-            # [HPU]
-            if token_idx is not None:
-                model_kwargs["token_idx"] = token_idx
-                model_kwargs["attention_mask"] = attention_mask
             unfinished_sequences = unfinished_sequences.mul((sum(next_tokens != i for i in eos_token_id)).long())
 
             # stop when each sentence is finished, or if we exceed the maximum length
@@ -1493,8 +1491,9 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 if unfinished_sequences.max() == 0 or stopping_criteria(input_ids, scores):
                     break
             else:
-                if unfinished_sequences.max() == 0 or token_idx.int() >= generation_config.max_length:
+                if unfinished_sequences.max() == 0 or token_idx >= generation_config.max_length:
                     break
+
             # [HPU]
             # yield input_ids if token_idx is None else input_ids[:token_idx.int()]
             yield input_ids
