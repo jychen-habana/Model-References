@@ -97,6 +97,7 @@ class ChatGLMConfig(PretrainedConfig):
 
         # [HPU] options for static shapes
         self.static_shapes = True
+        self.bucket_width = 256
 
         super().__init__(
             pad_token_id=pad_token_id,

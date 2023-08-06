@@ -32,6 +32,8 @@ from transformers.generation.utils import LogitsProcessorList, StoppingCriteriaL
 
 from .configuration_chatglm import ChatGLMConfig
 
+import time
+
 # flags required to enable jit fusion kernels
 
 if sys.platform != 'darwin':
@@ -55,12 +57,18 @@ def defined(v):
     return v is not None
 
 
-def calculate_input_padding(input_length, static_shapes=False, max_input_length=None):
+def round_up(n, multiple):
+    return (n + multiple - 1) // multiple * multiple
+
+
+def calculate_input_padding(input_length, static_shapes=False, bucket_width=None, max_input_length=None):
     if not static_shapes:
         return 0
+    if defined(bucket_width):
+        return round_up(input_length, bucket_width) - input_length
     if defined(max_input_length):
         return max_input_length - input_length
-    assert False, "Running with static_shapes requires setting 'max_input_length'"
+    assert False, "Running with static_shapes requires setting either 'bucket_width' or 'max_input_length'"
 
 
 class InvalidScoreLogitsProcessor(LogitsProcessor):
@@ -1200,7 +1208,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             if attention_mask is None:
                 attention_mask = self.get_masks(
                     input_ids,
-                    device=input_ids.device
+                    device=None # device=input_ids.device
                 )
             if position_ids is None:
                 position_ids = self.get_position_ids(
@@ -1211,11 +1219,12 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 )
             # [HPU]
             if self.config.static_shapes:
-                input_padding = calculate_input_padding(seq_length, self.config.static_shapes, self.max_sequence_length)
+                input_padding = calculate_input_padding(seq_length, self.config.static_shapes, self.config.bucket_width)
                 token_idx = torch.tensor(seq_length, device=input_ids.device)
                 input_ids = F.pad(input_ids, (0, input_padding), value=self.config.pad_token_id)
+                position_ids = F.pad(position_ids, (0, input_padding), value=0)
                 attention_mask = F.pad(attention_mask, (0, input_padding, 0, input_padding), value=True)
-                position_ids = torch.nn.functional.pad(position_ids, (0, input_padding), value=0)
+                attention_mask = attention_mask.to("hpu")
 
             return {
                 "input_ids": input_ids,
@@ -1363,6 +1372,8 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 prompt += "[Round {}]\n问：{}\n答：{}\n".format(i, old_query, response)
             prompt += "[Round {}]\n问：{}\n答：".format(len(history), query)
         inputs = tokenizer([prompt], return_tensors="pt")
+        # batch = 4
+        # inputs['input_ids'] = inputs['input_ids'].repeat(batch, 1)
         inputs = inputs.to(self.device)
         for outputs in self.stream_generate(**inputs, **gen_kwargs):
             outputs = outputs.tolist()[0][len(inputs["input_ids"][0]):]
@@ -1440,7 +1451,18 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         scores = None
         first_run = True
 
+        # activities = []
+        # activities.append(torch.profiler.ProfilerActivity.CPU)
+        # activities.append(torch.profiler.ProfilerActivity.HPU)
+        # prof = torch.profiler.profile(
+        #     activities=activities,
+        #     schedule=torch.profiler.schedule(wait=0, warmup=10, active=5, repeat=1),
+        #     on_trace_ready=torch.profiler.tensorboard_trace_handler('./hpu_profile/'),
+        #     record_shapes=False,
+        #     with_stack=True)
+        # prof.start()
         while True:
+            # start = time.time()
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             # forward pass to get next token
             outputs = self(
@@ -1495,8 +1517,9 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                     break
 
             # [HPU]
-            # yield input_ids if token_idx is None else input_ids[:token_idx.int()]
-            yield input_ids
+            yield input_ids if token_idx is None else input_ids[:token_idx]
+            # prof.step()
+            # print(f"[ChatGLM-6B] one token takes %.2f ms" %((time.time() - start)*1000))
 
     def quantize(self, bits: int, empty_init=False, **kwargs):
         if bits == 0:
