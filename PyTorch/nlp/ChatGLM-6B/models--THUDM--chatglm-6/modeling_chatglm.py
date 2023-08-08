@@ -64,7 +64,6 @@ def defined(v):
 
 
 def round_up(n, multiple):
-    # return (n + multiple - 1) // multiple * multiple
     return (n + multiple) // multiple * multiple
 
 
