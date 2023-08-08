@@ -53,12 +53,19 @@ CHATGLM_6B_PRETRAINED_MODEL_ARCHIVE_LIST = [
 ]
 
 
+def unwrap_ds(model):
+    if hasattr(model, 'module'):
+        return model.module
+    return model
+
+
 def defined(v):
     return v is not None
 
 
 def round_up(n, multiple):
-    return (n + multiple - 1) // multiple * multiple
+    # return (n + multiple - 1) // multiple * multiple
+    return (n + multiple) // multiple * multiple
 
 
 def calculate_input_padding(input_length, static_shapes=False, bucket_width=None, max_input_length=None):
@@ -69,6 +76,38 @@ def calculate_input_padding(input_length, static_shapes=False, bucket_width=None
     if defined(max_input_length):
         return max_input_length - input_length
     assert False, "Running with static_shapes requires setting either 'bucket_width' or 'max_input_length'"
+
+
+def calculate_max_length(input_length, max_length, max_new_tokens=None, bucket_width=None, max_input_length=None):
+    if defined(max_new_tokens) and defined(bucket_width):
+        return round_up(input_length + max_new_tokens, bucket_width)
+    if defined(max_new_tokens) and defined(max_input_length):
+        return max_input_length + max_new_tokens
+    if defined(max_input_length):
+        assert max_length >= max_input_length, \
+            f"max_input_length={max_input_length} is bigger then max_length={max_length}! Either increase max_length or specify max_new_tokens."
+    return max_length
+
+
+def update(prev, cur, dim, idx):
+    orig_cur = cur
+    if prev.shape[1] != cur.shape[1]:
+        assert prev.shape[1] % cur.shape[1] == 0, f'Cannot update kv-cache. BatchSize changed! {prev.shape[0]} vs {cur.shape[0]}'
+        # Repeat to accomodate bs/beam changes
+        cur = cur.repeat(1, prev.shape[1] // cur.shape[1], 1, 1)
+    if prev.shape[0] != cur.shape[0] and cur.shape[0] != 1:
+        # Pad to accomodate input bucketing
+        padding_len = prev.shape[0] - cur.shape[0]
+        cur = F.pad(cur, (0, 0, 0, 0, 0, 0, 0, padding_len))
+    if prev.shape == cur.shape:
+        # Initialize
+        prev.copy_(cur)
+        return orig_cur
+    assert cur.shape[0] == 1, f'Cannot update kv-cache. Unsupported shapes. prev:{prev.shape} cur:{cur.shape}'
+    if idx is not None:
+        return prev.index_copy_(dim, idx - 1, cur)
+    else:
+        return torch.cat((prev, cur), dim=dim)
 
 
 class InvalidScoreLogitsProcessor(LogitsProcessor):
@@ -271,22 +310,23 @@ def attention_fn(
         scaling_attention_score=True,
         use_cache=False,
         token_idx=None,
+        reuse_cache=None,
 ):
-    if layer_past is not None:
-        past_key, past_value = layer_past[0], layer_past[1]
-        if token_idx is None:
-            key_layer = torch.cat((past_key, key_layer), dim=0)
-            value_layer = torch.cat((past_value, value_layer), dim=0)
+    if layer_past is not None or reuse_cache:
+        if reuse_cache:
+            past_key, past_value = self.past_key, self.past_value
         else:
-            past_key.index_copy_(0, token_idx - 1, key_layer)
-            past_value.index_copy_(0, token_idx - 1, value_layer)
-            key_layer = past_key
-            value_layer = past_value
+            past_key, past_value = layer_past[0], layer_past[1]
+        key_layer = update(past_key, key_layer, 0, token_idx)
+        value_layer = update(past_value, value_layer, 0, token_idx)
     # seqlen, batch, num_attention_heads, hidden_size_per_attention_head
     seq_len, b, nh, hidden_size = key_layer.shape
 
     if use_cache:
-        present = (key_layer, value_layer)
+        if reuse_cache:
+            present = (key_layer.shape, value_layer.shape)
+        else:
+            present = (key_layer, value_layer)
     else:
         present = None
 
@@ -426,6 +466,8 @@ class SelfAttention(torch.nn.Module):
             bias=bias,
             dtype=params_dtype,
         )
+        self.past_key = None
+        self.past_value = None
 
     @staticmethod
     def attention_mask_func(attention_scores, attention_mask):
@@ -452,6 +494,15 @@ class SelfAttention(torch.nn.Module):
 
         return tensor_list
 
+    def allocate_kv_cache(self, batch_size, seq_len):
+        key_shape = (seq_len, batch_size, self.num_attention_heads, self.hidden_size_per_attention_head)
+        value_shape = (seq_len, batch_size, self.num_attention_heads, self.hidden_size_per_attention_head)
+        if self.past_key is None or self.past_key.shape != key_shape:
+            device = self.query_key_value.weight.device
+            dtype = self.query_key_value.weight.dtype
+            self.past_key = torch.empty(key_shape, dtype=dtype, device=device)
+            self.past_value = torch.empty(value_shape, dtype=dtype, device=device)
+
     def forward(
             self,
             hidden_states: torch.Tensor,
@@ -461,7 +512,8 @@ class SelfAttention(torch.nn.Module):
             layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
             use_cache: bool = False,
             output_attentions: bool = False,
-            token_idx: Optional[torch.Tensor] = None
+            token_idx: Optional[torch.Tensor] = None,
+            reuse_cache: Optional[bool] = False
     ):
         """
         hidden_states: [seq_len, batch, hidden_size]
@@ -512,7 +564,8 @@ class SelfAttention(torch.nn.Module):
             layer_id=layer_id,
             layer_past=layer_past,
             use_cache=use_cache,
-            token_idx=token_idx
+            token_idx=token_idx,
+            reuse_cache=reuse_cache
         )
 
         output = self.dense(context_layer)
@@ -636,6 +689,9 @@ class GLMBlock(torch.nn.Module):
             empty_init=empty_init
         )
 
+    def allocate_kv_cache(self, batch_size, seq_len):
+        self.attention.allocate_kv_cache(batch_size, seq_len)
+
     def forward(
             self,
             hidden_states: torch.Tensor,
@@ -645,7 +701,8 @@ class GLMBlock(torch.nn.Module):
             layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
             use_cache: bool = False,
             output_attentions: bool = False,
-            token_idx: Optional[torch.Tensor] = None
+            token_idx: Optional[torch.Tensor] = None,
+            reuse_cache: Optional[bool] = False
     ):
         """
         hidden_states: [seq_len, batch, hidden_size]
@@ -665,7 +722,8 @@ class GLMBlock(torch.nn.Module):
             layer_past=layer_past,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            token_idx=token_idx
+            token_idx=token_idx,
+            reuse_cache=reuse_cache
         )
 
         attention_output = attention_outputs[0]
@@ -914,6 +972,10 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
         # past_key_values = [(v[0], v[1]) for v in past_key_values]
         return past_key_values
 
+    def allocate_kv_cache(self, batch_size, seq_len):
+        for layer in self.layers:
+            layer.allocate_kv_cache(batch_size, seq_len)
+
     @add_start_docstrings_to_model_forward(CHATGLM_6B_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
         checkpoint=_CHECKPOINT_FOR_DOC,
@@ -932,6 +994,7 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
             output_hidden_states: Optional[bool] = None,
             token_idx: Optional[torch.Tensor] = None,
             return_dict: Optional[bool] = None,
+            reuse_cache: Optional[bool] = False
     ) -> Union[Tuple[torch.Tensor, ...], BaseModelOutputWithPast]:
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -1036,7 +1099,8 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
                     layer_past=layer_past,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
-                    token_idx=token_idx
+                    token_idx=token_idx,
+                    reuse_cache=reuse_cache
                 )
 
             hidden_states = layer_ret[0]
@@ -1199,7 +1263,8 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 "past_key_values": past,
                 "position_ids": position_ids,
                 "attention_mask": attention_mask,
-                "token_idx": token_idx
+                "token_idx": token_idx,
+                "reuse_cache": self.config.reuse_cache
             }
         else:
             if attention_mask is not None and attention_mask.dtype != torch.bool:
@@ -1219,20 +1284,28 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 )
             # [HPU]
             if self.config.static_shapes:
-                input_padding = calculate_input_padding(seq_length, self.config.static_shapes, self.config.bucket_width)
                 token_idx = torch.tensor(seq_length, device=input_ids.device)
+                input_padding = calculate_input_padding(seq_length, self.config.static_shapes,
+                                                        self.config.bucket_width, self.config.max_input_length)
                 input_ids = F.pad(input_ids, (0, input_padding), value=self.config.pad_token_id)
                 position_ids = F.pad(position_ids, (0, input_padding), value=0)
                 attention_mask = F.pad(attention_mask, (0, input_padding, 0, input_padding), value=True)
                 attention_mask = attention_mask.to("hpu")
+                if self.config.use_cache and self.config.reuse_cache:
+                    num_beams = 1
+                    unwrap_ds(self).allocate_kv_cache(batch_size * num_beams, self.max_sequence_length)
 
             return {
                 "input_ids": input_ids,
                 "past_key_values": past,
                 "position_ids": position_ids,
                 "attention_mask": attention_mask,
-                "token_idx": token_idx
+                "token_idx": token_idx,
+                "reuse_cache": self.config.reuse_cache
             }
+
+    def allocate_kv_cache(self, batch_size, seq_len):
+        self.transformer.allocate_kv_cache(batch_size, seq_len)
 
     def forward(
             self,
@@ -1247,6 +1320,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             output_hidden_states: Optional[bool] = None,
             token_idx: Optional[torch.Tensor] = None,
             return_dict: Optional[bool] = None,
+            reuse_cache: Optional[bool] = False
     ):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -1262,6 +1336,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             output_hidden_states=output_hidden_states,
             token_idx=token_idx,
             return_dict=return_dict,
+            reuse_cache=reuse_cache,
         )
 
         hidden_states = transformer_outputs[0]
@@ -1403,24 +1478,26 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         if isinstance(eos_token_id, int):
             eos_token_id = [eos_token_id]
 
-        has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
-        if has_default_max_length and generation_config.max_new_tokens is None:
-            warnings.warn(
-                f"Using `max_length`'s default ({generation_config.max_length}) to control the generation length. "
-                "This behaviour is deprecated and will be removed from the config in v5 of Transformers -- we"
-                " recommend using `max_new_tokens` to control the maximum length of the generation.",
-                UserWarning,
-            )
-        elif generation_config.max_new_tokens is not None:
-            generation_config.max_length = generation_config.max_new_tokens + input_ids_seq_length
-            if not has_default_max_length:
-                logger.warn(
-                    f"Both `max_new_tokens` (={generation_config.max_new_tokens}) and `max_length`(="
-                    f"{generation_config.max_length}) seem to have been set. `max_new_tokens` will take precedence. "
-                    "Please refer to the documentation for more information. "
-                    "(https://huggingface.co/docs/transformers/main/en/main_classes/text_generation)",
+        # [HPU]
+        if not self.config.static_shapes:
+            has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
+            if has_default_max_length and generation_config.max_new_tokens is None:
+                warnings.warn(
+                    f"Using `max_length`'s default ({generation_config.max_length}) to control the generation length. "
+                    "This behaviour is deprecated and will be removed from the config in v5 of Transformers -- we"
+                    " recommend using `max_new_tokens` to control the maximum length of the generation.",
                     UserWarning,
                 )
+            elif generation_config.max_new_tokens is not None:
+                generation_config.max_length = generation_config.max_new_tokens + input_ids_seq_length
+                if not has_default_max_length:
+                    logger.warn(
+                        f"Both `max_new_tokens` (={generation_config.max_new_tokens}) and `max_length`(="
+                        f"{generation_config.max_length}) seem to have been set. `max_new_tokens` will take precedence. "
+                        "Please refer to the documentation for more information. "
+                        "(https://huggingface.co/docs/transformers/main/en/main_classes/text_generation)",
+                        UserWarning,
+                    )
 
         if input_ids_seq_length >= generation_config.max_length:
             input_ids_string = "decoder_input_ids" if self.config.is_encoder_decoder else "input_ids"
@@ -1478,6 +1555,12 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 input_ids = model_inputs["input_ids"]
                 next_token_logits = outputs.logits.index_select(-2, token_idx - 1).squeeze(-2)
                 model_inputs['attention_mask'] = model_inputs['attention_mask'].index_select(2, token_idx - 1)
+                if self.config.use_cache and self.config.reuse_cache:
+                    mask_padding = calculate_input_padding(model_inputs['attention_mask'].shape[-1],
+                                                           self.config.static_shapes,
+                                                           max_input_length=self.max_sequence_length)
+                    model_inputs['attention_mask'] = F.pad(
+                        model_inputs['attention_mask'], (0, mask_padding), value=True)
                 first_run = False
             else:
                 next_token_logits = outputs.logits[:, -1, :]
@@ -1498,6 +1581,10 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             if token_idx is None:
                 input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
             else:
+                if token_idx >= input_ids.shape[-1]:
+                    input_padding = calculate_input_padding(input_ids.shape[-1], self.config.static_shapes,
+                                                            self.config.bucket_width, self.config.max_input_length)
+                    input_ids = F.pad(input_ids, (0, input_padding), value=self.config.pad_token_id)
                 input_ids.index_copy_(1, token_idx, next_tokens[:, None])
                 token_idx.add_(1)
                 model_kwargs['token_idx'] = token_idx

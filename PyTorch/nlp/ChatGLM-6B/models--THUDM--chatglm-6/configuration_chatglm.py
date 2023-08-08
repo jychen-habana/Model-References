@@ -75,6 +75,11 @@ class ChatGLMConfig(PretrainedConfig):
             quantization_bit=0,
             pre_seq_len=None,
             prefix_projection=False,
+            static_shapes = True,
+            reuse_cache = True,
+            max_input_length = None, # 1024,
+            max_new_tokens = None, # 1024,
+            bucket_width = 256,
             **kwargs
     ):
         self.num_layers = num_layers
@@ -95,9 +100,12 @@ class ChatGLMConfig(PretrainedConfig):
         self.pre_seq_len = pre_seq_len
         self.prefix_projection = prefix_projection
 
-        # [HPU] options for static shapes
-        self.static_shapes = True
-        self.bucket_width = 256
+        # [HPU] options
+        self.static_shapes = static_shapes
+        self.reuse_cache = reuse_cache
+        self.max_input_length = max_input_length
+        self.max_new_tokens = max_new_tokens
+        self.bucket_width = bucket_width
 
         super().__init__(
             pad_token_id=pad_token_id,
