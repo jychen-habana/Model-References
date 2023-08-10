@@ -27,7 +27,7 @@ from transformers.modeling_outputs import (
 )
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
-from transformers.generation.logits_process import LogitsProcessor
+from transformers.generation.logits_process import LogitsProcessor, LogitsWarper
 from transformers.generation.utils import LogitsProcessorList, StoppingCriteriaList, GenerationConfig, ModelOutput
 
 from .configuration_chatglm import ChatGLMConfig
@@ -114,6 +114,46 @@ class InvalidScoreLogitsProcessor(LogitsProcessor):
         if torch.isnan(scores).any() or torch.isinf(scores).any():
             scores.zero_()
             scores[..., 5] = 5e4
+        return scores
+
+
+class HabanaTopPLogitsWarper(LogitsWarper):
+    """
+    [`LogitsWarper`] that performs top-p, i.e. restricting to top tokens summing to prob_cut_off <= prob_cut_off.
+
+    Args:
+        top_p (`float`):
+            If set to < 1, only the smallest set of most probable tokens with probabilities that add up to `top_p` or
+            higher are kept for generation.
+        filter_value (`float`, *optional*, defaults to `-float("Inf")`):
+            All filtered values will be set to this float value.
+        min_tokens_to_keep (`int`, *optional*, defaults to 1):
+            Minimum number of tokens that cannot be filtered.
+    """
+
+    def __init__(self, top_p: float, filter_value: float = -float("Inf"), min_tokens_to_keep: int = 1):
+        top_p = float(top_p)
+        if top_p < 0 or top_p > 1.0:
+            raise ValueError(f"`top_p` has to be a float > 0 and < 1, but is {top_p}")
+
+        self.top_p = top_p
+        self.filter_value = filter_value
+        self.min_tokens_to_keep = min_tokens_to_keep
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        sorted_logits, sorted_indices = torch.sort(scores, descending=False)
+        cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+
+        # Remove tokens with cumulative top_p above the threshold (token with 0 are kept)
+        sorted_indices_to_remove = cumulative_probs <= (1 - self.top_p)
+        if self.min_tokens_to_keep > 1:
+            # Keep at least min_tokens_to_keep
+            sorted_indices_to_remove[..., -self.min_tokens_to_keep :] = 0
+
+        # scatter sorted tensors to original indexing
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        scores = scores + indices_to_remove * -10000.0
+        # scores = scores.masked_fill(indices_to_remove, self.filter_value)
         return scores
 
 
@@ -366,10 +406,14 @@ def attention_fn(
         self.scale_mask_softmax.scale = query_key_layer_scaling_coeff
         attention_probs = self.scale_mask_softmax(attention_scores, attention_mask.contiguous())
     else:
-        if not (attention_mask == 0).all():
-            # if auto-regressive, skip
-            attention_scores.masked_fill_(attention_mask, -10000.0)
-        dtype = attention_scores.dtype
+        if token_idx is None:
+            if not (attention_mask == 0).all():
+                # if auto-regressive, skip
+                attention_scores.masked_fill_(attention_mask, -10000.0)
+            dtype = attention_scores.dtype
+        else: # [HPU]
+            dtype = attention_scores.dtype
+            attention_scores = attention_scores + attention_mask * -10000.0
         attention_scores = attention_scores.float()
         attention_scores = attention_scores * query_key_layer_scaling_coeff
 
@@ -1522,6 +1566,9 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             generation_config=generation_config, stopping_criteria=stopping_criteria
         )
         logits_warper = self._get_logits_warper(generation_config)
+        # [HPU]
+        logits_warper.pop(-1)
+        logits_warper.append(HabanaTopPLogitsWarper(top_p=generation_config.top_p))
 
         unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
         scores = None
@@ -1603,7 +1650,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                     break
 
             # [HPU]
-            yield input_ids if token_idx is None else input_ids[:token_idx]
+            yield input_ids if token_idx is None else input_ids[:,:token_idx]
             # prof.step()
             # print(f"[ChatGLM-6B] one token takes %.2f ms" %((time.time() - start)*1000))
 
