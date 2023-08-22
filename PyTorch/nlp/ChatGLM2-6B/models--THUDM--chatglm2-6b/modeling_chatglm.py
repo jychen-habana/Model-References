@@ -435,8 +435,8 @@ class SelfAttention(torch.nn.Module):
         if self.past_key is None or self.past_key.shape != key_shape:
             device = self.query_key_value.weight.device
             dtype = self.query_key_value.weight.dtype
-            self.past_key = torch.empty(key_shape, dtype=dtype, device=device)
-            self.past_value = torch.empty(value_shape, dtype=dtype, device=device)
+            self.past_key = torch.ones(key_shape, dtype=dtype, device=device)
+            self.past_value = torch.ones(value_shape, dtype=dtype, device=device)
 
     def forward(
             self, hidden_states, attention_mask, rotary_pos_emb, kv_cache=None, use_cache=True,
@@ -782,15 +782,14 @@ class ChatGLMPreTrainedModel(PreTrainedModel):
 
     def get_masks(self, input_ids, past_key_values, padding_mask=None, global_token_idx=None, local_token_idx=None):
         batch_size, seq_length = input_ids.shape
-        if global_token_idx and local_token_idx:
-            seq_length = local_token_idx
-            past_length = global_token_idx - local_token_idx
-        else:
-            past_length = 0
-            if past_key_values:
-                past_length = past_key_values[0][0].shape[0]
         full_attention_mask = torch.ones(batch_size, seq_length, seq_length, device=input_ids.device)
         full_attention_mask.tril_()
+        past_length = 0
+        if past_key_values:
+            if global_token_idx and local_token_idx:
+                past_length = global_token_idx - local_token_idx
+            else:
+                past_length = past_key_values[0][0].shape[0]
         if past_length:
             full_attention_mask = torch.cat((torch.ones(batch_size, seq_length, past_length,
                                                         device=input_ids.device), full_attention_mask), dim=-1)
@@ -1042,37 +1041,29 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                                                                self.config.bucket_width)
                         attention_mask = F.pad(attention_mask, (0, mask_padding), value=True)
                         kv_slice_index = torch.tensor(attention_mask.shape[-1])
-                        print("[cjy] after padding, attention_mask {}, kv_slice_index {}".format(attention_mask.shape, kv_slice_index))
                 attention_mask.index_fill_(-1, self.global_token_idx-1, False)
         else:
             if self.config.static_shapes:
+                batch_size, seq_length = input_ids.shape
                 attention_mask = self.get_masks(input_ids, past_key_values,
                                                 global_token_idx=self.global_token_idx,
                                                 local_token_idx=self.local_token_idx)
-                batch_size, seq_length = input_ids.shape
                 input_padding = calculate_input_padding(seq_length, self.config.static_shapes,
-                                                        self.config.bucket_width, self.config.max_input_length)
-                print("\n[cjy] before static shapes: global_token_idx {}, token_idx {}, input_ids {}, position_ids {}, attn_mask {}".format(
-                    self.global_token_idx, self.local_token_idx, input_ids.shape, position_ids.shape, attention_mask.shape))
+                                                        self.config.bucket_width,self.config.max_input_length)
                 input_ids = F.pad(input_ids, (0, input_padding), value=self.config.pad_token_id)
                 position_ids = F.pad(position_ids, (0, input_padding), value=-1)
-                _, _, mask_len_q, mask_len_k = attention_mask.shape
-                mask_q_padding = calculate_input_padding(mask_len_q, self.config.static_shapes,
-                                                         self.config.bucket_width, self.config.max_input_length)
-                mask_k_padding = input_ids.shape[-1] - mask_len_k
+                mask_q_padding = mask_k_padding = input_padding # mask_k_padding = input_ids.shape[-1] - mask_len_k
                 if self.config.use_cache and self.config.reuse_cache:
                     num_beams = 1
                     unwrap_ds(self).allocate_kv_cache(batch_size * num_beams, self.max_sequence_length)
-                    kv_slice_index = torch.tensor(mask_len_k+
-                                                        calculate_input_padding(mask_len_k,
-                                                                                self.config.static_shapes,
-                                                                                self.config.bucket_width),
-                                                                                device=input_ids.device)
+                    _, _, mask_len_q, mask_len_k = attention_mask.shape
+                    kv_slice_index = torch.tensor(mask_len_k+calculate_input_padding(mask_len_k,
+                                                                                     self.config.static_shapes,
+                                                                                     self.config.bucket_width),
+                                                                                     device=input_ids.device)
                     if mask_len_q != mask_len_k:
                         mask_k_padding = kv_slice_index.item() - mask_len_k
                 attention_mask = F.pad(attention_mask, (0, mask_k_padding, 0, mask_q_padding), value=True)
-                print("\n[cjy] after static shapes: global_token_idx {}, token_idx {}, input_ids {}, position_ids {}, attn_mask {}\n".format(
-                    self.global_token_idx, self.local_token_idx, input_ids.shape, position_ids.shape, attention_mask.shape))
         return {
             "input_ids": input_ids,
             "past_key_values": past_key_values,
@@ -1112,7 +1103,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            token_idx=self.local_token_idx,
+            token_idx=self.global_token_idx,
             kv_slice_index=kv_slice_index,
             reuse_cache=reuse_cache,
             output_hidden_states=output_hidden_states,
@@ -1245,7 +1236,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 self.global_token_idx.add_(inputs["input_ids"].shape[-1])
         if past_key_values is not None:
             # [HPU]
-            if self.config.static_shapes and self.local_token_idx:
+            if self.config.static_shapes and self.global_token_idx and self.local_token_idx:
                 past_length = self.global_token_idx - self.local_token_idx
             else:
                 past_length = past_key_values[0][0].shape[0]
@@ -1356,7 +1347,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
 
             # pre-process distribution
             next_token_scores = logits_processor(input_ids, next_token_logits)
-            # next_token_scores = logits_warper(input_ids, next_token_scores)
+            next_token_scores = logits_warper(input_ids, next_token_scores)
 
             # sample
             probs = nn.functional.softmax(next_token_scores, dim=-1)
@@ -1375,8 +1366,8 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                                                             self.config.bucket_width, self.config.max_input_length)
                     input_ids = F.pad(input_ids, (0, input_padding), value=self.config.pad_token_id)
                 input_ids.index_copy_(-1, self.local_token_idx, next_tokens[:, None])
-                self.local_token_idx.add_(1)
                 self.global_token_idx.add_(1)
+                self.local_token_idx.add_(1)
                 model_kwargs["attention_mask"] = model_inputs["attention_mask"]
                 model_kwargs["kv_slice_index"] = model_inputs["kv_slice_index"]
             # print("[cjy] next_tokens {}, input_ids after update {}, token_idx {}".format(next_tokens, input_ids[:,:self.local_token_idx], self.local_token_idx))
