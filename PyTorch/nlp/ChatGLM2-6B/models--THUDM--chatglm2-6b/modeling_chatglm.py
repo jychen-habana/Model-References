@@ -493,12 +493,12 @@ class SelfAttention(torch.nn.Module):
                 cache_k, cache_v = self.past_key[:kv_slice_index], self.past_value[:kv_slice_index]
             else:
                 cache_k, cache_v = kv_cache
-            if query_layer.shape[0] == 1 or kv_cache is None:
-                key_layer = update(cache_k, key_layer, 0, idx=token_idx)
-                value_layer = update(cache_v, value_layer, 0, idx=token_idx)
-            elif kv_cache is not None:
+            if kv_cache is not None and query_layer.shape[0] != 1: # round[>1]-step[1]
                 key_layer = update(cache_k, key_layer, 0, index_tensor=position_ids[0])
                 value_layer = update(cache_v, value_layer, 0, index_tensor=position_ids[0])
+            else: # round[1]-step[>=1] & round[>1]-step[>1]
+                key_layer = update(cache_k, key_layer, 0, idx=token_idx)
+                value_layer = update(cache_v, value_layer, 0, idx=token_idx)
         if use_cache:
             if reuse_cache:
                 kv_cache = (key_layer.shape, value_layer.shape)
@@ -971,8 +971,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
     def __init__(self, config: ChatGLMConfig, empty_init=True, device=None):
         super().__init__(config)
 
-        # self.max_sequence_length = config.max_length
-        self.max_sequence_length = 8192
+        self.max_sequence_length = 8192 # config.max_length
         self.transformer = ChatGLMModel(config, empty_init=empty_init, device=device)
         self.config = config
         self.quantized = False
@@ -1033,8 +1032,8 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 input_ids = input_ids[:, -1:]
                 position_ids = position_ids[..., -1:]
             else:
-                input_ids = input_ids.index_select(-1, self.local_token_idx - 1)
-                position_ids = position_ids.index_select(-1, self.local_token_idx - 1)
+                input_ids = input_ids.index_select(-1, self.local_token_idx-1)
+                position_ids = position_ids.index_select(-1, self.local_token_idx-1)
                 if self.config.use_cache and self.config.reuse_cache:
                     if self.global_token_idx >= attention_mask.shape[-1]:
                         mask_padding = calculate_input_padding(attention_mask.shape[-1], self.config.static_shapes,
@@ -1224,16 +1223,16 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             inputs = self.build_inputs(tokenizer, query, history=history)
         else:
             inputs = self.build_stream_inputs(tokenizer, query, history=history)
-        if self.config.static_shapes and past_key_values is None and not history:
-            self.local_token_idx = torch.tensor(0, device=inputs["input_ids"].device)
-            self.global_token_idx = torch.tensor(0, device=inputs["input_ids"].device)
         # [HPU]
         if self.config.static_shapes:
-            self.local_token_idx.fill_(inputs["input_ids"].shape[-1])
+            if past_key_values is None and not history:
+                self.global_token_idx = torch.tensor(0, device=inputs["input_ids"].device)
+                self.local_token_idx = torch.tensor(0, device=inputs["input_ids"].device)
             if not self.global_token_idx.is_nonzero():
                 self.global_token_idx.fill_(inputs["input_ids"].shape[-1])
             else:
                 self.global_token_idx.add_(inputs["input_ids"].shape[-1])
+            self.local_token_idx.fill_(inputs["input_ids"].shape[-1])
         if past_key_values is not None:
             # [HPU]
             if self.config.static_shapes and self.global_token_idx and self.local_token_idx:
@@ -1389,7 +1388,9 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 if unfinished_sequences.max() == 0 or stopping_criteria(input_ids, scores):
                     break
             else:
-                if unfinished_sequences.max() == 0 or self.local_token_idx >= generation_config.max_length:
+                if unfinished_sequences.max() == 0 or self.local_token_idx >= generation_config.max_length or \
+                    self.global_token_idx >= self.max_sequence_length:
+                    self.global_token_idx.sub_(1)
                     break
 
     def quantize(self, bits: int, empty_init=False, device=None, **kwargs):
