@@ -468,7 +468,7 @@ class SelfAttention(torch.nn.Module):
         )
 
     def allocate_kv_cache(self, batch_size, seq_len):
-        if self.past_key is None:
+        if self.past_key is None or self.past_key.shape[1] != batch_size:
             device = self.query_key_value.weight.device
             dtype = self.query_key_value.weight.dtype
             # self.past_key = self._allocate_memory(seq_len, batch_size, device="hpu", dtype=torch.bfloat16)
