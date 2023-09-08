@@ -27,6 +27,18 @@ from .configuration_chatglm import ChatGLMConfig
 
 import habana_frameworks.torch.core as htcore
 
+try:
+    from habana_frameworks.torch.hpex.normalization import FusedRMSNorm as FusedRMSNorm
+except ImportError:
+    print("Not using HPU fused kernel for RMSNorm")
+    FusedRMSNorm = None
+
+# try:
+#     from habana_frameworks.torch.hpex.kernels import RotaryPosEmbeddingHelperV2 as FusedRoPE
+# except ImportError:
+#     print("Not using HPU fused kernel for apply_rotary_pos_emb")
+#     FusedRoPE = None
+
 # flags required to enable jit fusion kernels
 
 if sys.platform != 'darwin':
@@ -229,11 +241,6 @@ class RMSNorm(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor):
         input_dtype = hidden_states.dtype
 
-        try:
-            from habana_frameworks.torch.hpex.normalization import FusedRMSNorm as FusedRMSNorm
-        except ImportError:
-            # print("Not using HPU fused kernel for RMSNorm")
-            FusedRMSNorm = None
         if FusedRMSNorm:
             hidden_states = FusedRMSNorm.apply(hidden_states.float(), self.weight.float(), self.eps)
             return hidden_states.to(input_dtype)
@@ -278,37 +285,33 @@ class CoreAttention(torch.nn.Module):
         if pytorch_major_version >= 2:
             query_layer, key_layer, value_layer = [k.permute(1, 2, 0, 3) for k in [query_layer, key_layer, value_layer]]
 
-            # # (B, M, T, H/M) -> (B, M, 1, T, H/M)
-            # query_layer = query_layer.unsqueeze(2)
-            # # (B, M, 1, T, H/M) -> (B*G, M/G, T, H/M)
-            # query_layer = query_layer.view(query_layer.size()[0]*self.multi_query_group_num,
-            #                                self.num_attention_heads//self.multi_query_group_num,
-            #                                query_layer.size()[-2], query_layer.size()[-1])
-            # # (B, G, T, H/M) -> (B, G, 1, T, H/M)
-            # key_layer = key_layer.unsqueeze(2)
-            # # (B, G, 1, T, H/M) -> (B*G, 1, T, H/M)
-            # key_layer = key_layer.reshape(key_layer.size()[0]*self.multi_query_group_num,
-            #                            key_layer.size()[-3], key_layer.size()[-2], key_layer.size()[-1])
-            # # (B, G, T, H/M) -> (B, G, 1, T, H/M)
-            # value_layer = value_layer.unsqueeze(2)
-            # # (B, G, 1, T, H/M) -> (B*G, 1, T, H/M)
-            # value_layer = value_layer.reshape(value_layer.size()[0]*self.multi_query_group_num,
-            #                                value_layer.size()[-3], key_layer.size()[-2], key_layer.size()[-1])
-            # if attention_mask is None and query_layer.shape[2] == key_layer.shape[2]:
-            #     context_layer = torch.nn.functional.scaled_dot_product_attention(query_layer, key_layer, value_layer,
-            #                                                                      is_causal=True)
-            # else:
-            #     if attention_mask is not None:
-            #         attention_mask = ~attention_mask
-            #     context_layer = torch.nn.functional.scaled_dot_product_attention(query_layer, key_layer, value_layer,
-            #                                                                      attention_mask)
+            # (B, M, T, H/M) -> (B, M, 1, T, H/M) -> (B*G, M/G, T, H/M)
+            query_layer = query_layer.unsqueeze(2).view(query_layer.size()[0]*self.multi_query_group_num,
+                                                        self.num_attention_heads//self.multi_query_group_num,
+                                                        query_layer.size()[-2], query_layer.size()[-1])
+            # (B, G, T, H/M) -> (B, G, 1, T, H/M) -> (B*G, 1, T, H/M)
+            key_layer = key_layer.unsqueeze(2)
+            key_layer = key_layer.reshape(key_layer.size()[0]*self.multi_query_group_num,
+                                          key_layer.size()[-3], key_layer.size()[-2], key_layer.size()[-1])
+            # (B, G, T, H/M) -> (B, G, 1, T, H/M) -> (B*G, 1, T, H/M)
+            value_layer = value_layer.unsqueeze(2)
+            value_layer = value_layer.reshape(value_layer.size()[0]*self.multi_query_group_num,
+                                              value_layer.size()[-3], key_layer.size()[-2], key_layer.size()[-1])
+            if attention_mask is None and query_layer.shape[2] == key_layer.shape[2]:
+                context_layer = torch.nn.functional.scaled_dot_product_attention(query_layer, key_layer, value_layer,
+                                                                                 is_causal=True)
+            else:
+                if attention_mask is not None:
+                    attention_mask = ~attention_mask
+                context_layer = torch.nn.functional.scaled_dot_product_attention(query_layer, key_layer, value_layer,
+                                                                                 attention_mask)
 
-            # (B, M, T, H/M) -> (B, M, 1, T, H/M)
-            query_layer = query_layer.unsqueeze(2)
-            # (B, M, 1, T, H/M) -> (B*G, M/G, T, H/M) -> (M/G, B*G, T, H/M)
-            query_layer = query_layer.view(query_layer.size()[0]*self.multi_query_group_num,
-                                           self.num_attention_heads//self.multi_query_group_num,
-                                           query_layer.size()[-2], query_layer.size()[-1]).transpose(0,1)
+            '''
+            # for loop impl
+            # (B, M, T, H/M) -> (B, M, 1, T, H/M) -> (B*G, M/G, T, H/M) -> (M/G, B*G, T, H/M)
+            query_layer = query_layer.unsqueeze(2).view(query_layer.size()[0]*self.multi_query_group_num,
+                                                        self.num_attention_heads//self.multi_query_group_num,
+                                                        query_layer.size()[-2], query_layer.size()[-1]).transpose(0,1)
             # (B, G, T, H/M) -> (B*G, T, H/M)
             key_layer = key_layer.reshape(key_layer.size()[0]*self.multi_query_group_num,
                                           key_layer.size()[-2], key_layer.size()[-1])
@@ -326,6 +329,8 @@ class CoreAttention(torch.nn.Module):
                     context_layer_group.append(torch.nn.functional.scaled_dot_product_attention(
                         query_layer[i], key_layer, value_layer, ~attention_mask))
             context_layer = torch.stack(context_layer_group, dim=0).transpose(0,1)
+            '''
+
             context_layer = context_layer.reshape(context_layer.size()[0]//self.multi_query_group_num,
                                                   context_layer.size()[1]*self.multi_query_group_num,
                                                   context_layer.size()[-2], context_layer.size()[-1])
@@ -547,9 +552,9 @@ class SelfAttention(torch.nn.Module):
         # core attention computation
         # ==================================
 
-        htcore.mark_step()
+        # htcore.mark_step()
         context_layer = self.core_attention(query_layer, key_layer, value_layer, attention_mask)
-        htcore.mark_step()
+        # htcore.mark_step()
 
         # =================
         # Output. [sq, b, h]
@@ -750,7 +755,7 @@ class GLMTransformer(torch.nn.Module):
                                                           attention_mask.size()[-3],
                                                           attention_mask.size()[-2],
                                                           attention_mask.size()[-1])
-        attention_mask = attention_mask.squeeze(1)
+        # attention_mask = attention_mask.squeeze(1) # for loop impl
         for index in range(self.num_layers):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
@@ -778,6 +783,8 @@ class GLMTransformer(torch.nn.Module):
             hidden_states, kv_cache = layer_ret
             if use_cache:
                 presents = presents + (kv_cache,)
+            if index % 2 == 0:
+                htcore.mark_step()
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
@@ -1212,7 +1219,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         # inputs = inputs.to(self.device)
         return inputs
 
-    @torch.inference_mode()
+    # @torch.inference_mode()
     def chat(self, tokenizer, query: str, history: List[Tuple[str, str]] = None, max_length: int = 8192, num_beams=1,
              do_sample=True, top_p=0.8, temperature=0.8, logits_processor=None, **kwargs):
         if history is None:
@@ -1230,7 +1237,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         history = history + [(query, response)]
         return response, history
 
-    @torch.inference_mode()
+    # @torch.inference_mode()
     def stream_chat(self, tokenizer, query: str, history: List[Tuple[str, str]] = None, past_key_values=None,
                     max_length: int = 8192, do_sample=True, top_p=0.8, temperature=0.8, logits_processor=None,
                     return_past_key_values=False, **kwargs):
@@ -1268,7 +1275,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 else:
                     yield response, new_history
 
-    @torch.inference_mode()
+    # @torch.inference_mode()
     def stream_generate(
             self,
             input_ids,
@@ -1351,6 +1358,9 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         #     with_stack=True)
         # prof.start()
         while True:
+            if PERF_PRINT:
+                import time
+                step_start = time.time()
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             # forward pass to get next token
             outputs = self(
@@ -1362,7 +1372,8 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
 
             next_token_logits = outputs.logits[:, -1, :]
             # pre-process distribution
-            next_token_scores = logits_processor(input_ids, next_token_logits)
+            # next_token_scores = logits_processor(input_ids, next_token_logits)
+            next_token_scores = next_token_logits
             next_token_scores = logits_warper(input_ids, next_token_scores)
 
             # sample
@@ -1386,6 +1397,8 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             # stop when each sentence is finished, or if we exceed the maximum length
             if unfinished_sequences.max() == 0 or stopping_criteria(input_ids, scores):
                 break
+            if PERF_PRINT:
+                print(f"[ChatGLM2-6B] one token takes %.2f ms" %((time.time() - step_start)*1000), "input_length: ", input_ids.shape[-1])
             # prof.step()
         if PERF_PRINT:
             print(f"[ChatGLM2-6B] avg step time %.2f ms" %((time.time() - start)*1000/input_ids.shape[-1]), "max_length: ", input_ids.shape[-1])
