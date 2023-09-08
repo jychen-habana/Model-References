@@ -468,7 +468,7 @@ class SelfAttention(torch.nn.Module):
         )
 
     def allocate_kv_cache(self, batch_size, seq_len):
-        if self.past_key is None:
+        if self.past_key is None or self.past_key.shape[1] != batch_size:
             device = self.query_key_value.weight.device
             dtype = self.query_key_value.weight.dtype
             # self.past_key = self._allocate_memory(seq_len, batch_size, device="hpu", dtype=torch.bfloat16)
@@ -1203,7 +1203,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         # inputs = inputs.to(self.device)
         return inputs
 
-    def build_stream_inputs(self, tokenizer, query: str, history: List[Tuple[str, str]] = None):
+    def build_stream_inputs(self, tokenizer, query: str, history: List[Tuple[str, str]] = None, bs_repeat: int = 1):
         if history:
             prompt = "\n\n[Round {}]\n\n问：{}\n\n答：".format(len(history) + 1, query)
             input_ids = tokenizer.encode(prompt, add_special_tokens=False)
@@ -1212,10 +1212,12 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         else:
             prompt = "[Round {}]\n\n问：{}\n\n答：".format(len(history) + 1, query)
             inputs = tokenizer([prompt], return_tensors="pt")
-        # batch = 16
-        # inputs["input_ids"] = inputs["input_ids"].repeat(batch, 1)
-        # inputs["position_ids"] = inputs["position_ids"].repeat(batch, 1)
-        # inputs["attention_mask"] = inputs["attention_mask"].repeat(batch, 1)
+        batch = bs_repeat
+        inputs["input_ids"] = inputs["input_ids"].repeat(batch, 1)
+        inputs["position_ids"] = inputs["position_ids"].repeat(batch, 1)
+        inputs["attention_mask"] = inputs["attention_mask"].repeat(batch, 1)
+        print("[cjy] input prompt size {}, repeat input to {}".format(
+            inputs["input_ids"].shape[-1], inputs["input_ids"].shape[0]))
         # inputs = inputs.to(self.device)
         return inputs
 
@@ -1242,7 +1244,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
     @torch.no_grad()
     def stream_chat(self, tokenizer, query: str, history: List[Tuple[str, str]] = None, past_key_values=None,
                     max_length: int = 8192, do_sample=True, top_p=0.8, temperature=0.8, logits_processor=None,
-                    return_past_key_values=False, **kwargs):
+                    return_past_key_values=False, bs_repeat=1, **kwargs):
         if history is None:
             history = []
         if logits_processor is None:
@@ -1253,7 +1255,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         if past_key_values is None and not return_past_key_values:
             inputs = self.build_inputs(tokenizer, query, history=history)
         else:
-            inputs = self.build_stream_inputs(tokenizer, query, history=history)
+            inputs = self.build_stream_inputs(tokenizer, query, history=history, bs_repeat=bs_repeat)
         if past_key_values is not None:
             # past_length = past_key_values[0][0].shape[0]
             past_length = self.global_seq_len
@@ -1346,7 +1348,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
         scores = None
 
-        PERF_PRINT = False
+        PERF_PRINT = True
         if PERF_PRINT:
             import time
             start = time.time()
@@ -1398,13 +1400,13 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             else:
                 yield input_ids
             # stop when each sentence is finished, or if we exceed the maximum length
-            if unfinished_sequences.max() == 0 or stopping_criteria(input_ids, scores):
+            if stopping_criteria(input_ids, scores):
                 break
             if PERF_PRINT:
                 print(f"[ChatGLM2-6B] one token takes %.2f ms" %((time.time() - step_start)*1000), "input_length: ", input_ids.shape[-1])
             # prof.step()
         if PERF_PRINT:
-            print(f"[ChatGLM2-6B] avg step time %.2f ms" %((time.time() - start)*1000/input_ids.shape[-1]), "max_length: ", input_ids.shape[-1])
+            print(f"[ChatGLM2-6B] avg step time %.2f ms" %((time.time() - start)*1000/128), "max_length: ", input_ids.shape[-1])
 
     def quantize(self, bits: int, empty_init=False, device=None, **kwargs):
         if bits == 0:
