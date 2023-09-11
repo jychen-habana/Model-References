@@ -1363,9 +1363,9 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         #     with_stack=True)
         # prof.start()
         while True:
-            if PERF_PRINT:
-                import time
-                step_start = time.time()
+            # if PERF_PRINT:
+            #     import time
+            #     step_start = time.time()
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             # forward pass to get next token
             outputs = self(
@@ -1402,11 +1402,15 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             # stop when each sentence is finished, or if we exceed the maximum length
             if stopping_criteria(input_ids, scores):
                 break
-            if PERF_PRINT:
-                print(f"[ChatGLM2-6B] one token takes %.2f ms" %((time.time() - step_start)*1000), "input_length: ", input_ids.shape[-1])
+            # if PERF_PRINT:
+            #     print("[ChatGLM2-6B] one token takes {:.2f} ms, input_length {}".format(
+            #         (time.time() - step_start)*1000, input_ids.shape[-1]))
             # prof.step()
         if PERF_PRINT:
-            print(f"[ChatGLM2-6B] avg step time %.2f ms" %((time.time() - start)*1000/128), "max_length: ", input_ids.shape[-1])
+            max_new_token = 128
+            avg_step_time = (time.time() - start)*1000/max_new_token
+            print("\n[ChatGLM2-6B] avg_step_time {:.2f} ms, batch_size {}, max_length {}, tokens_per_sec {:.2f}".format(
+                avg_step_time, input_ids.shape[0], input_ids.shape[-1], 1000/avg_step_time*input_ids.shape[0]))
 
     def quantize(self, bits: int, empty_init=False, device=None, **kwargs):
         if bits == 0:
