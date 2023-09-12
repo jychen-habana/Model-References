@@ -101,7 +101,6 @@ def main():
                                                                         past_key_values=past_key_values,
                                                                         return_past_key_values=True,
                                                                         max_length=max_length,
-                                                                        max_new_tokens=args.max_new_tokens,
                                                                         bs_repeat=bs_repeat):
                 if stop_stream:
                     stop_stream = False

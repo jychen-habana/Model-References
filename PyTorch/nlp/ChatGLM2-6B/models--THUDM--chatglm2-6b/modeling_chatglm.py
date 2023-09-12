@@ -1244,7 +1244,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
     @torch.no_grad()
     def stream_chat(self, tokenizer, query: str, history: List[Tuple[str, str]] = None, past_key_values=None,
                     max_length: int = 8192, do_sample=True, top_p=0.8, temperature=0.8, logits_processor=None,
-                    return_past_key_values=False, max_new_tokens=128, bs_repeat=1, **kwargs):
+                    return_past_key_values=False, bs_repeat=1, **kwargs):
         if history is None:
             history = []
         if logits_processor is None:
@@ -1266,8 +1266,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             attention_mask = torch.cat((attention_mask.new_ones(1, past_length), attention_mask), dim=1)
             inputs['attention_mask'] = attention_mask
         for outputs in self.stream_generate(**inputs, past_key_values=past_key_values,
-                                            return_past_key_values=return_past_key_values,
-                                            max_new_tokens=max_new_tokens, **gen_kwargs):
+                                            return_past_key_values=return_past_key_values, **gen_kwargs):
             if return_past_key_values:
                 outputs, past_key_values = outputs
             outputs = outputs.tolist()[0][len(inputs["input_ids"][0]):]
@@ -1290,7 +1289,6 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             stopping_criteria: Optional[StoppingCriteriaList] = None,
             prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
             return_past_key_values=False,
-            max_new_tokens=128,
             **kwargs,
     ):
         batch_size, input_ids_seq_length = input_ids.shape[0], input_ids.shape[-1]
@@ -1349,6 +1347,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
 
         unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
         scores = None
+        max_new_tokens=generation_config.max_length - input_ids_seq_length
 
         PERF_PRINT = True
         if PERF_PRINT:
