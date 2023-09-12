@@ -1474,7 +1474,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
 
     @torch.no_grad()
     def stream_chat(self, tokenizer, query: str, history: List[Tuple[str, str]] = None, max_length: int = 2048,
-                    do_sample=True, top_p=0.7, temperature=0.95, logits_processor=None, **kwargs):
+                    do_sample=True, top_p=0.7, temperature=0.95, logits_processor=None, bs_repeat=1, **kwargs):
         if history is None:
             history = []
         if logits_processor is None:
@@ -1490,8 +1490,8 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 prompt += "[Round {}]\n问：{}\n答：{}\n".format(i, old_query, response)
             prompt += "[Round {}]\n问：{}\n答：".format(len(history), query)
         inputs = tokenizer([prompt], return_tensors="pt")
-        # batch = 4
-        # inputs['input_ids'] = inputs['input_ids'].repeat(batch, 1)
+        batch = bs_repeat
+        inputs['input_ids'] = inputs['input_ids'].repeat(batch, 1)
         inputs = inputs.to(self.device)
         for outputs in self.stream_generate(**inputs, **gen_kwargs):
             outputs = outputs.tolist()[0][len(inputs["input_ids"][0]):]
@@ -1572,6 +1572,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
 
         unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
         scores = None
+        max_new_tokens=generation_config.max_length - input_ids_seq_length
         first_run = True
 
         # activities = []
@@ -1584,6 +1585,10 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         #     record_shapes=False,
         #     with_stack=True)
         # prof.start()
+        PERF_PRINT = True
+        if PERF_PRINT:
+            import time
+            start = time.time()
         while True:
             # start = time.time()
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
@@ -1646,13 +1651,18 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 if unfinished_sequences.max() == 0 or stopping_criteria(input_ids, scores):
                     break
             else:
-                if unfinished_sequences.max() == 0 or token_idx >= generation_config.max_length:
+                # if unfinished_sequences.max() == 0 or token_idx >= generation_config.max_length:
+                if token_idx >= generation_config.max_length:
                     break
 
             # [HPU]
             yield input_ids if token_idx is None else input_ids[:,:token_idx]
             # prof.step()
             # print(f"[ChatGLM-6B] one token takes %.2f ms" %((time.time() - start)*1000))
+        if PERF_PRINT:
+            avg_step_time = (time.time() - start)*1000/max_new_tokens
+            print("\n[ChatGLM-6B] batch_size:{}, max_length:{}, avg_step_time:{:.2f} ms, tokens_per_sec:{:.2f}".format(
+                input_ids.shape[0], input_ids[:,:token_idx].shape[-1], avg_step_time, 1000/avg_step_time*input_ids.shape[0]))
 
     def quantize(self, bits: int, empty_init=False, **kwargs):
         if bits == 0:
