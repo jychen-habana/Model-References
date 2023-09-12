@@ -43,8 +43,9 @@ def signal_handler(signal, frame):
 def setup_parser():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter, description='ChatGLM2-6B for HPU')
     parser.add_argument('--prompt', '-p', type=int, help="Number of input prompt tokens", default=128)
-    parser.add_argument('--max_new_tokens', '-t', type=int, help="Number of maximum new tokens", default=128)
     parser.add_argument('--repeat', '-r', type=int, help="Number of times each query should be repeated", default=5)
+    parser.add_argument('--max_new_tokens', '-t', type=int, help="Number of maximum new tokens", default=128)
+    parser.add_argument('--batch_size', '-b', type=int, help="Number of times each query should be repeated", default=4)
     return parser
 
 
@@ -71,44 +72,39 @@ def get_prompts(input_prompt=128, max_new_tokens=128, prompt_repeat=5):
     return queries, max_length
 
 
-# queries = ['晚上睡不着怎么办','clear']
-# max_length = 512
-bs_repeat_list = [1, 2, 4]
-
-
 def main():
     parser = setup_parser()
     args = parser.parse_args()
     queries, max_length = get_prompts(args.prompt, args.max_new_tokens, args.repeat)
 
-    print("[prompt] {} [repeat] {} [max_new_tokens] {}".format(args.prompt, args.max_new_tokens, args.repeat))
-    for bs_repeat in bs_repeat_list:
-        past_key_values, history = None, []
-        global stop_stream
-        print("欢迎使用 ChatGLM2-6B 模型，输入内容即可进行对话，clear 清空对话历史，stop 终止程序")
-        # query = input("\n用户：")
-        for i, query in enumerate(queries):
-            if query.strip() == "stop":
+    print("[batch_size] {} [run prompt] {} [run repeat] {} [max_new_tokens] {}".format(
+        args.batch_size, args.prompt, args.repeat, args.max_new_tokens))
+    past_key_values, history = None, []
+    global stop_stream
+    print("欢迎使用 ChatGLM2-6B 模型，输入内容即可进行对话，clear 清空对话历史，stop 终止程序")
+    # query = input("\n用户：")
+    for i, query in enumerate(queries):
+        if query.strip() == "stop":
+            break
+        if query.strip() == "clear":
+            past_key_values, history = None, []
+            os.system(clear_command)
+            print("欢迎使用 ChatGLM2-6B 模型，输入内容即可进行对话，clear 清空对话历史，stop 终止程序")
+            continue
+        print("\nChatGLM：", end="")
+        current_length = 0
+        for response, history, past_key_values in model.stream_chat(tokenizer, query, history=history,
+                                                                    past_key_values=past_key_values,
+                                                                    return_past_key_values=True,
+                                                                    max_length=max_length,
+                                                                    bs_repeat=args.batch_size):
+            if stop_stream:
+                stop_stream = False
                 break
-            if query.strip() == "clear":
-                past_key_values, history = None, []
-                os.system(clear_command)
-                print("欢迎使用 ChatGLM2-6B 模型，输入内容即可进行对话，clear 清空对话历史，stop 终止程序")
-                continue
-            print("\nChatGLM：", end="")
-            current_length = 0
-            for response, history, past_key_values in model.stream_chat(tokenizer, query, history=history,
-                                                                        past_key_values=past_key_values,
-                                                                        return_past_key_values=True,
-                                                                        max_length=max_length,
-                                                                        bs_repeat=bs_repeat):
-                if stop_stream:
-                    stop_stream = False
-                    break
-                else:
-                    print(response[current_length:], end="", flush=True)
-                    current_length = len(response)
-            print("")
+            else:
+                print(response[current_length:], end="", flush=True)
+                current_length = len(response)
+        print("")
 
 
 if __name__ == "__main__":
