@@ -51,7 +51,10 @@ def setup_parser():
 
 def get_prompts(input_prompt=128, max_new_tokens=128, prompt_repeat=5):
     queries = list()
-    if input_prompt == 128:
+    if input_prompt == 19:
+        prompt_19 = "晚上睡不着怎么办"
+        queries.append(prompt_19)
+    elif input_prompt == 128:
         prompt_128 = "患者男，年龄29岁，血型O，因思维迟钝，易激怒，因发热伴牙龈出血14天，乏力、头晕5天就诊我院急诊科。快速完善检查，血常规显示患者三系血细胞重度减低，凝血功能检查提示APTT明显延长，纤维蛋白原降低，血液科会诊后发现患者高热、牙龈持续出血，胸骨压痛阳性.于3903年3月7日入院治疗，出现头痛头晕。答："
         queries.append(prompt_128)
     elif input_prompt == 1024:
