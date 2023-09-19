@@ -284,19 +284,31 @@ class CoreAttention(torch.nn.Module):
         pytorch_major_version = int(torch.__version__.split('.')[0])
         if pytorch_major_version >= 2:
             query_layer, key_layer, value_layer = [k.permute(1, 2, 0, 3) for k in [query_layer, key_layer, value_layer]]
-
-            # (B, M, T, H/M) -> (B, M, 1, T, H/M) -> (B*G, M/G, T, H/M)
-            query_layer = query_layer.unsqueeze(2).view(query_layer.size()[0]*self.multi_query_group_num,
-                                                        self.num_attention_heads//self.multi_query_group_num,
-                                                        query_layer.size()[-2], query_layer.size()[-1])
-            # (B, G, T, H/M) -> (B, G, 1, T, H/M) -> (B*G, 1, T, H/M)
-            key_layer = key_layer.unsqueeze(2)
-            key_layer = key_layer.reshape(key_layer.size()[0]*self.multi_query_group_num,
-                                          key_layer.size()[-3], key_layer.size()[-2], key_layer.size()[-1])
-            # (B, G, T, H/M) -> (B, G, 1, T, H/M) -> (B*G, 1, T, H/M)
-            value_layer = value_layer.unsqueeze(2)
-            value_layer = value_layer.reshape(value_layer.size()[0]*self.multi_query_group_num,
-                                              value_layer.size()[-3], key_layer.size()[-2], key_layer.size()[-1])
+            not_first_step = query_layer.size()[2] != key_layer.size()[2] and query_layer.size()[2] == 1
+            if not_first_step: # Q_T=1
+                # (B, M, T, H/M) -> (B*G, M/G, H/M)
+                query_layer = query_layer.reshape(query_layer.size()[0]*self.multi_query_group_num,
+                                                  self.num_attention_heads//self.multi_query_group_num,
+                                                  query_layer.size()[-1])
+                # (B, G, T, H/M) -> (B*G, T, H/M)
+                key_layer = key_layer.reshape(key_layer.size()[0]*self.multi_query_group_num,
+                                              key_layer.size()[-2], key_layer.size()[-1])
+                # (B, G, T, H/M) -> (B*G, T, H/M)
+                value_layer = value_layer.reshape(value_layer.size()[0]*self.multi_query_group_num,
+                                                  value_layer.size()[-2], value_layer.size()[-1])
+            else:
+                # (B, M, T, H/M) -> (B, M, 1, T, H/M) -> (B*G, M/G, T, H/M)
+                query_layer = query_layer.unsqueeze(2).view(query_layer.size()[0]*self.multi_query_group_num,
+                                                            self.num_attention_heads//self.multi_query_group_num,
+                                                            query_layer.size()[-2], query_layer.size()[-1])
+                # (B, G, T, H/M) -> (B, G, 1, T, H/M) -> (B*G, 1, T, H/M)
+                key_layer = key_layer.unsqueeze(2)
+                key_layer = key_layer.reshape(key_layer.size()[0]*self.multi_query_group_num,
+                                            key_layer.size()[-3], key_layer.size()[-2], key_layer.size()[-1])
+                # (B, G, T, H/M) -> (B, G, 1, T, H/M) -> (B*G, 1, T, H/M)
+                value_layer = value_layer.unsqueeze(2)
+                value_layer = value_layer.reshape(value_layer.size()[0]*self.multi_query_group_num,
+                                                value_layer.size()[-3], value_layer.size()[-2], value_layer.size()[-1])
             if attention_mask is None and query_layer.shape[2] == key_layer.shape[2]:
                 context_layer = torch.nn.functional.scaled_dot_product_attention(query_layer, key_layer, value_layer,
                                                                                  is_causal=True)
@@ -331,9 +343,15 @@ class CoreAttention(torch.nn.Module):
             context_layer = torch.stack(context_layer_group, dim=0).transpose(0,1)
             '''
 
-            context_layer = context_layer.reshape(context_layer.size()[0]//self.multi_query_group_num,
-                                                  context_layer.size()[1]*self.multi_query_group_num,
-                                                  context_layer.size()[-2], context_layer.size()[-1])
+            if not_first_step:
+                context_layer = context_layer.unsqueeze(-2)
+                context_layer = context_layer.reshape(context_layer.size()[0]//self.multi_query_group_num,
+                                                      context_layer.size()[1]*self.multi_query_group_num,
+                                                      context_layer.size()[-2], context_layer.size()[-1])
+            else:
+                context_layer = context_layer.reshape(context_layer.size()[0]//self.multi_query_group_num,
+                                                      context_layer.size()[1]*self.multi_query_group_num,
+                                                      context_layer.size()[-2], context_layer.size()[-1])
             context_layer = context_layer.permute(2, 0, 1, 3)
             new_context_layer_shape = context_layer.size()[:-2] + (self.hidden_size_per_partition,)
             context_layer = context_layer.reshape(*new_context_layer_shape)
@@ -524,9 +542,9 @@ class SelfAttention(torch.nn.Module):
             key_layer = apply_rotary_pos_emb(key_layer, rotary_pos_emb)
 
         # adjust key and value for inference
-        cache_k, cache_v = self.past_key[:global_seq_len], self.past_value[:global_seq_len]
-        key_layer = update(cache_k, key_layer, 0, idx=position_ids[0])
-        value_layer = update(cache_v, value_layer, 0, idx=position_ids[0])
+        key_layer = update(self.past_key, key_layer, 0, idx=position_ids[0])
+        value_layer = update(self.past_value, value_layer, 0, idx=position_ids[0])
+        key_layer, value_layer = key_layer[:global_seq_len], value_layer[:global_seq_len]
         if use_cache:
             kv_cache = (key_layer, value_layer)
         else:
@@ -755,7 +773,9 @@ class GLMTransformer(torch.nn.Module):
                                                           attention_mask.size()[-3],
                                                           attention_mask.size()[-2],
                                                           attention_mask.size()[-1])
-        # attention_mask = attention_mask.squeeze(1) # for loop impl
+        not_first_step = hidden_states.size()[0] == 1
+        if not_first_step:
+            attention_mask = attention_mask.squeeze(1) # for loop impl
         for index in range(self.num_layers):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
