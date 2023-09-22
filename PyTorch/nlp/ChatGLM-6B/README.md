@@ -381,3 +381,25 @@ model = load_model_on_gpus("THUDM/chatglm-6b", num_gpus=2)
   year={2022}
 }
 ```
+
+## Run ChatGLM-6B on HPU
+- Start with a Habana PyTorch Docker image (verified on 1.11 release)
+- Clone forked Model-References
+```shell
+git clone https://github.com/jychen-habana/Model-References.git 
+```
+- Checkout to branch: enable_CHatGLM-6B_on_HPU, install requirements
+```shell
+cd Model-References/PyTorch/nlp/ChatGLM-6B
+pip install -r requirements.txt 
+```
+- First run to get model weights and modeling scripts
+```shell
+python cli_demo.py
+```
+- Replace default modeling scripts (e.g. ~/.cache/huggingface/hub/ models--THUDM--chatglm-6b/ snapshots/*/) with scripts in forked Model-References/PyTorch/nlp/ChatGLM-6B/models--THUDM--chatglm-6b
+- Remove folder "~/.cache/huggingface/modules", it will cache the previous running scripts
+- Second run to reproduce
+```shell
+python cli_demo.py
+``` 
