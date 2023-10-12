@@ -1573,6 +1573,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
         scores = None
         max_new_tokens=generation_config.max_length - input_ids_seq_length
+        print("\n=====input_length:{},max_length:{},decode_length:{},batch_size:{}".format(input_ids.shape[-1], generation_config.max_length, max_new_tokens, input_ids.shape[0]))
         first_run = True
 
         # activities = []
@@ -1586,11 +1587,15 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         #     with_stack=True)
         # prof.start()
         PERF_PRINT = True
+        PERF_PRINT_FIRST_STEP = True
+        first_step_latency = None
         if PERF_PRINT:
             import time
             start = time.time()
         while True:
-            # start = time.time()
+            if PERF_PRINT and PERF_PRINT_FIRST_STEP:
+                import time
+                step_start = time.time()
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             # forward pass to get next token
             outputs = self(
@@ -1657,12 +1662,20 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
 
             # [HPU]
             yield input_ids if token_idx is None else input_ids[:,:token_idx]
+            if PERF_PRINT and PERF_PRINT_FIRST_STEP:
+                PERF_PRINT_FIRST_STEP = False
+                first_step_latency = (time.time() - step_start)*1000
             # prof.step()
             # print(f"[ChatGLM-6B] one token takes %.2f ms" %((time.time() - start)*1000))
         if PERF_PRINT:
-            avg_step_time = (time.time() - start)*1000/max_new_tokens
-            print("\n[ChatGLM-6B] batch_size:{}, max_length:{}, avg_step_time:{:.2f} ms, tokens_per_sec:{:.2f}".format(
-                input_ids.shape[0], input_ids[:,:token_idx].shape[-1], avg_step_time, 1000/avg_step_time*input_ids.shape[0]))
+            total_latency = (time.time() - start)*1000
+            latency_mean = total_latency / max_new_tokens
+            total_tps = 1000 / latency_mean * input_ids.shape[0]
+            prefill_tps = 1000 / first_step_latency * input_ids.shape[0]
+            decode_tps = 1000 / (total_latency - first_step_latency) * (max_new_tokens - 1) * input_ids.shape[0]
+            print("=====prefill_tps:{:.2f},decode_tps:{:.2f},total_tps:{:.2f},latency_mean:{:.2f}".format(prefill_tps, decode_tps, total_tps, latency_mean))
+            # print("\n[ChatGLM-6B] batch_size:{}, max_length:{}, avg_step_time:{:.2f} ms, tokens_per_sec:{:.2f}".format(
+            #     input_ids.shape[0], input_ids[:,:token_idx].shape[-1], latency_mean, 1000/latency_mean*input_ids.shape[0]))
 
     def quantize(self, bits: int, empty_init=False, **kwargs):
         if bits == 0:

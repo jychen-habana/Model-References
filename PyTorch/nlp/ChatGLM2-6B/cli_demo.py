@@ -104,7 +104,7 @@ def main():
     queries, max_length = get_prompts(args.prompt, args.max_length, args.max_new_tokens, args.repeat)
 
     print("[ChatGLM2-6B] batch_size: {} run_prompt: {} run_repeat: {} max_length: {}".format(
-        args.batch_size, args.prompt, args.repeat, args.max_length))
+        args.batch_size, args.prompt, args.repeat, max_length))
     past_key_values, history = None, []
     global stop_stream
     print("欢迎使用 ChatGLM2-6B 模型，输入内容即可进行对话，clear 清空对话历史，stop 终止程序")
@@ -128,7 +128,7 @@ def main():
                 stop_stream = False
                 break
             else:
-                # print(response[current_length:], end="", flush=True)
+                print(response[current_length:], end="", flush=True)
                 current_length = len(response)
         print("")
 
