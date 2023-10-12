@@ -211,38 +211,6 @@ class RotaryEmbedding(nn.Module):
         )
 
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-# @torch.jit.script
-# def apply_rotary_pos_emb(x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
-#     import pdb
-#     pdb.set_trace()
-#     # x: [sq, b, np, hn]
-#     sq, b, np, hn = x.size(0), x.size(1), x.size(2), x.size(3)
-#     # rot_dim = rope_cache.shape[-2] * 2
-#     # x, x_pass = x[..., :rot_dim], x[..., rot_dim:]
-#     # truncate to support variable sizes
-#     rope_cache = rope_cache[:sq]
-#     rope_cache = rope_cache.unsqueeze(-2)
-#     # xshaped = x.reshape(sq, -1, np, rot_dim // 2, 2)
-#     # rope_cache = rope_cache.view(sq, -1, 1, xshaped.size(3), 2)
-#     x_out2 = (x * rope_cache[..., 0]) + (rotate_half(x) * rope_cache[..., 1])
-#     # x_out2 = torch.stack(
-#     #     [
-#     #         xshaped[..., 0] * rope_cache[..., 0] - xshaped[..., 1] * rope_cache[..., 1],
-#     #         xshaped[..., 1] * rope_cache[..., 0] + xshaped[..., 0] * rope_cache[..., 1],
-#     #     ],
-#     #     -1,
-#     # )
-#     # x_out2 = x_out2.flatten(3)
-#     return torch.cat((x_out2, x_pass), dim=-1)
-
-
 @torch.jit.script
 def apply_rotary_pos_emb(x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
     # x: [sq, b, np, hn]
@@ -1046,7 +1014,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
     def __init__(self, config: ChatGLMConfig, empty_init=True, device=None):
         super().__init__(config)
 
-        self.max_sequence_length = 8192 # config.seq_length
+        self.max_sequence_length = 2048 # 8192 # config.seq_length
         self.transformer = ChatGLMModel(config, empty_init=empty_init, device=device)
         self.config = config
         self.quantized = False
@@ -1118,63 +1086,43 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             is_first_forward: bool = True,
             **kwargs
     ) -> dict:
-        # input_ids = input_ids.to("hpu")
         if past_key_values == None:
             self.global_seq_len = 0
-        past_length = self.global_seq_len
         # only last token for input_ids if past is not None
         if position_ids is None:
             position_ids = self.get_position_ids(input_ids, device=input_ids.device)
         if not is_first_forward:
             position_ids = position_ids[..., -1:]
             input_ids = input_ids[:, -1:]
-            self.global_seq_len += 1   # global seq len in all cycles of chat
-            last_token_idx = input_ids.shape[1] - 1         # last token idx of prompt in current cycle of chat
-            global_seq_len_bulk = calculate_input_padding(self.global_seq_len, self.config.static_shapes, # bulked global seq len
-                                                          self.config.bucket_width, self.config.max_input_length) + self.global_seq_len
-            full_attention_mask = self.get_masks(past_length, input_ids, global_seq_len_bulk)
+        if self.config.use_cache and self.config.reuse_cache:
+            unwrap_ds(self).allocate_kv_cache(input_ids.shape[0], self.max_sequence_length)
+        past_length = self.global_seq_len
+        self.global_seq_len += input_ids.shape[1]   # global seq len in all cycles of chat
+        last_token_idx = input_ids.shape[1] - 1         # last token idx of prompt in current cycle of chat
+        global_seq_len_bulk = calculate_input_padding(self.global_seq_len, self.config.static_shapes, # bulked global seq len
+                                                      self.config.bucket_width, self.config.max_input_length) + self.global_seq_len
+        input_ids_bulk = calculate_input_padding(input_ids.shape[1], self.config.static_shapes, # bulked input seq len
+                                                 self.config.bucket_width, self.config.max_input_length) + input_ids.shape[1]
+        input_ids_padded = input_ids
+        position_ids_padded = position_ids
+        input_padding_len = input_ids_bulk - last_token_idx - 1
+        if last_token_idx > 0 and input_padding_len > 0:    #for prompt of each cycle chat
+            input_ids_padded = torch.nn.functional.pad(input_ids, (0, input_padding_len), value=self.config.pad_token_id)
+            batch_size, seq_length = input_ids_padded.shape
+            position_ids_padded = torch.arange(position_ids_padded[0][0], position_ids_padded[0][0] + seq_length, 1,
+                                               dtype=torch.long, device=input_ids_padded.device).unsqueeze(0).repeat(batch_size, 1)
+        full_attention_mask = self.get_masks(past_length, input_ids_padded, global_seq_len_bulk)
 
-            # print(input_ids.shape, position_ids.shape, position_ids.shape, full_attention_mask.shape)
-            return {
-                "input_ids": input_ids.to("hpu"),
-                "past_key_values": past_key_values,
-                "position_ids": position_ids.to("hpu"),
-                "attention_mask": None,
-                "return_last_logit": True,
-                "global_seq_len": global_seq_len_bulk,
-                "last_token_idx": torch.tensor(last_token_idx, device="hpu"),
-                "full_attention_mask": full_attention_mask.to("hpu")
-            }
-        else:
-            if self.config.use_cache and self.config.reuse_cache:
-                unwrap_ds(self).allocate_kv_cache(input_ids.shape[0], self.max_sequence_length)
-            self.global_seq_len += input_ids.shape[1]   # global seq len in all cycles of chat
-            last_token_idx = input_ids.shape[1] - 1         # last token idx of prompt in current cycle of chat
-            global_seq_len_bulk = calculate_input_padding(self.global_seq_len, self.config.static_shapes, # bulked global seq len
-                                                        self.config.bucket_width, self.config.max_input_length) + self.global_seq_len
-            input_ids_bulk = calculate_input_padding(input_ids.shape[1], self.config.static_shapes, # bulked input seq len
-                                                    self.config.bucket_width, self.config.max_input_length) + input_ids.shape[1]
-            input_ids_padded = input_ids
-            position_ids_padded = position_ids
-            input_padding_len = input_ids_bulk - last_token_idx - 1
-            if last_token_idx > 0 and input_padding_len > 0:    #for prompt of each cycle chat
-                input_ids_padded = torch.nn.functional.pad(input_ids, (0, input_padding_len), value=self.config.pad_token_id)
-                batch_size, seq_length = input_ids_padded.shape
-                position_ids_padded = torch.arange(position_ids_padded[0][0], position_ids_padded[0][0] + seq_length, 1,
-                                                dtype=torch.long, device=input_ids_padded.device).unsqueeze(0).repeat(batch_size, 1)
-            full_attention_mask = self.get_masks(past_length, input_ids_padded, global_seq_len_bulk)
-
-            # print(input_ids.shape, input_ids_padded.shape, position_ids.shape, position_ids_padded.shape, full_attention_mask.shape)
-            return {
-                "input_ids": input_ids_padded.to("hpu"),
-                "past_key_values": past_key_values,
-                "position_ids": position_ids_padded.to("hpu"),
-                "attention_mask": None,
-                "return_last_logit": True,
-                "global_seq_len": global_seq_len_bulk,
-                "last_token_idx": torch.tensor(last_token_idx, device="hpu"),
-                "full_attention_mask": full_attention_mask.to("hpu")
-            }
+        return {
+            "input_ids": input_ids_padded.to("hpu"),
+            "past_key_values": past_key_values,
+            "position_ids": position_ids_padded.to("hpu"),
+            "attention_mask": None,
+            "return_last_logit": True,
+            "global_seq_len": global_seq_len_bulk,
+            "last_token_idx": torch.tensor(last_token_idx, device="hpu"),
+            "full_attention_mask": full_attention_mask.to("hpu")
+        }
 
     def allocate_kv_cache(self, batch_size, seq_len):
         self.transformer.allocate_kv_cache(batch_size, seq_len)
@@ -1288,8 +1236,6 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         inputs["input_ids"] = inputs["input_ids"].repeat(batch, 1)
         inputs["position_ids"] = inputs["position_ids"].repeat(batch, 1)
         inputs["attention_mask"] = inputs["attention_mask"].repeat(batch, 1)
-        print("[cjy] input prompt size {}, repeat input to {}".format(
-            inputs["input_ids"].shape[-1], inputs["input_ids"].shape[0]))
         # inputs = inputs.to(self.device)
         return inputs
 
@@ -1420,8 +1366,11 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
         scores = None
         max_new_tokens=generation_config.max_length - input_ids_seq_length
+        print("\n=====input_length:{},max_length:{},decode_length:{},batch_size:{}".format(input_ids.shape[-1], generation_config.max_length, max_new_tokens, input_ids.shape[0]))
 
         PERF_PRINT = True
+        PERF_PRINT_FIRST_STEP = True
+        first_step_latency = None
         if PERF_PRINT:
             import time
             start = time.time()
@@ -1436,9 +1385,9 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         #     with_stack=True)
         # prof.start()
         while True:
-            # if PERF_PRINT:
-            #     import time
-            #     step_start = time.time()
+            if PERF_PRINT and PERF_PRINT_FIRST_STEP:
+                import time
+                step_start = time.time()
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             # forward pass to get next token
             outputs = self(
@@ -1450,8 +1399,8 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
 
             next_token_logits = outputs.logits[:, -1, :]
             # pre-process distribution
-            next_token_scores = logits_processor(input_ids, next_token_logits)
-            # next_token_scores = next_token_logits
+            # next_token_scores = logits_processor(input_ids, next_token_logits)
+            next_token_scores = next_token_logits
             next_token_scores = logits_warper(input_ids, next_token_scores)
 
             # sample
@@ -1467,22 +1416,28 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )
-            # unfinished_sequences = unfinished_sequences.mul((sum(next_tokens != i for i in eos_token_id)).long())
+            unfinished_sequences = unfinished_sequences.mul((sum(next_tokens != i for i in eos_token_id)).long())
+            if return_past_key_values:
+                yield input_ids, outputs.past_key_values
+            else:
+                yield input_ids
             # stop when each sentence is finished, or if we exceed the maximum length
             if stopping_criteria(input_ids, scores):
-                if return_past_key_values:
-                    yield input_ids, outputs.past_key_values
-                else:
-                    yield input_ids
                 break
-            # if PERF_PRINT:
-            #     print("[ChatGLM2-6B] one token takes {:.2f} ms, input_length {}".format(
-            #         (time.time() - step_start)*1000, input_ids.shape[-1]))
+            if PERF_PRINT and PERF_PRINT_FIRST_STEP:
+                PERF_PRINT_FIRST_STEP = False
+                first_step_latency = (time.time() - step_start)*1000
+                # print("[ChatGLM2-6B] first_step_time {:.2f} ms, input_length {}".format(first_step_latency, input_ids.shape[-1]))
             # prof.step()
         if PERF_PRINT:
-            avg_step_time = (time.time() - start)*1000/max_new_tokens
-            print("\n[ChatGLM2-6B] batch_size:{}, max_length:{}, avg_step_time:{:.2f} ms, tokens_per_sec:{:.2f}".format(
-                input_ids.shape[0], input_ids.shape[-1], avg_step_time, 1000/avg_step_time*input_ids.shape[0]))
+            total_latency = (time.time() - start)*1000
+            latency_mean = total_latency / max_new_tokens
+            total_tps = 1000 / latency_mean * input_ids.shape[0]
+            prefill_tps = 1000 / first_step_latency * input_ids.shape[0]
+            decode_tps = 1000 / (total_latency - first_step_latency) * (max_new_tokens - 1) * input_ids.shape[0]
+            print("=====prefill_tps:{:.2f},decode_tps:{:.2f},total_tps:{:.2f},latency_mean:{:.2f}".format(prefill_tps, decode_tps, total_tps, latency_mean))
+            # print("[ChatGLM2-6B] batch_size:{}, max_length:{}, avg_step_time:{:.2f} ms, tokens_per_sec:{:.2f}\n".format(
+            #     input_ids.shape[0], input_ids.shape[-1], latency_mean, 1000/latency_mean*input_ids.shape[0]))
 
     def quantize(self, bits: int, empty_init=False, device=None, **kwargs):
         if bits == 0:
