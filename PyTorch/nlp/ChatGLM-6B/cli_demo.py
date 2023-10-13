@@ -91,7 +91,7 @@ def main():
         args.batch_size, args.prompt, args.repeat, max_length))
 
     if max_length == args.prompt:
-        print("[CHatGLM-6B] input_length is {}, but max_length is set to {}".format(args.prompt, max_length))
+        print("[CHatGLM-6B] input_length is {}, but max_length is set to {}, exit normally!!!".format(args.prompt, max_length))
         exit(0)
 
     history = []
