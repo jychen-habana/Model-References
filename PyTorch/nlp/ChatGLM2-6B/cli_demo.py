@@ -106,7 +106,7 @@ def main():
     print("[ChatGLM2-6B] batch_size: {} run_prompt: {} run_repeat: {} max_length: {}".format(
         args.batch_size, args.prompt, args.repeat, max_length))
 
-    if max_length == args.prompt:
+    if max_length <= args.prompt:
         print("[CHatGLM2-6B] input_length is {}, but max_length is set to {}, exit normally!!!".format(args.prompt, max_length))
         exit(0)
     past_key_values, history = None, []
