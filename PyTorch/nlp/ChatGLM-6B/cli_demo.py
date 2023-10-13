@@ -38,7 +38,7 @@ def signal_handler(signal, frame):
 def setup_parser():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter, description='ChatGLM-6B for HPU')
     parser.add_argument('--repeat', '-r', type=int, help="Number of times each query should be repeated", default=5)
-    parser.add_argument('--batch_size', '-b', type=int, help="Number of times each query should be repeated", default=4, choices=[1, 2, 4, 8, 16, 32, 64, 128])
+    parser.add_argument('--batch_size', '-b', type=int, help="Number of times each query should be repeated", default=4, choices=[1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128])
     parser.add_argument('--prompt', '-p', type=int, help="Number of input prompt tokens", default=32, choices=[32, 128, 256, 512, 1024, 1536, 1792, 1920])
     parser.add_argument('--max_length', '-t', type=int, help="Number of maximum tokens", default=None, choices=[512, 1024, 2048])
     parser.add_argument('--max_new_tokens', '-n', type=int, help="Number of maximum new tokens", default=128)
@@ -89,6 +89,10 @@ def main():
 
     print("[ChatGLM-6B] batch_size: {} run_prompt: {} run_repeat: {} max_length: {}".format(
         args.batch_size, args.prompt, args.repeat, max_length))
+
+    if max_length == args.prompt:
+        print("[CHatGLM-6B] input_length is {}, but max_length is set to {}".format(args.prompt, max_length))
+        exit(0)
 
     history = []
     global stop_stream
