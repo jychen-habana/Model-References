@@ -211,24 +211,36 @@ class RotaryEmbedding(nn.Module):
         )
 
 
+# @torch.jit.script
+# def apply_rotary_pos_emb(x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
+#     # x: [sq, b, np, hn]
+#     sq, b, np, hn = x.size(0), x.size(1), x.size(2), x.size(3)
+#     rot_dim = rope_cache.shape[-2] * 2
+#     x, x_pass = x[..., :rot_dim], x[..., rot_dim:]
+#     # truncate to support variable sizes
+#     rope_cache = rope_cache[:sq]
+#     xshaped = x.reshape(sq, -1, np, rot_dim // 2, 2)
+#     rope_cache = rope_cache.view(sq, -1, 1, xshaped.size(3), 2)
+#     x_out2 = torch.stack(
+#         [
+#             xshaped[..., 0] * rope_cache[..., 0] - xshaped[..., 1] * rope_cache[..., 1],
+#             xshaped[..., 1] * rope_cache[..., 0] + xshaped[..., 0] * rope_cache[..., 1],
+#         ],
+#         -1,
+#     )
+#     x_out2 = x_out2.flatten(3)
+#     return torch.cat((x_out2, x_pass), dim=-1)
+
+
 @torch.jit.script
-def apply_rotary_pos_emb(x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
-    # x: [sq, b, np, hn]
-    sq, b, np, hn = x.size(0), x.size(1), x.size(2), x.size(3)
-    rot_dim = rope_cache.shape[-2] * 2
+def apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                         mask_even: torch.Tensor, mask_odd: torch.Tensor,
+                         rope_mask_even: torch.Tensor, rope_mask_odd: torch.Tensor) -> torch.Tensor:
+    def transform(x):
+        return ((x @ mask_even) * rope_mask_even) + ((x @ mask_odd) * rope_mask_odd)
+    rot_dim = cos.shape[-1]
     x, x_pass = x[..., :rot_dim], x[..., rot_dim:]
-    # truncate to support variable sizes
-    rope_cache = rope_cache[:sq]
-    xshaped = x.reshape(sq, -1, np, rot_dim // 2, 2)
-    rope_cache = rope_cache.view(sq, -1, 1, xshaped.size(3), 2)
-    x_out2 = torch.stack(
-        [
-            xshaped[..., 0] * rope_cache[..., 0] - xshaped[..., 1] * rope_cache[..., 1],
-            xshaped[..., 1] * rope_cache[..., 0] + xshaped[..., 0] * rope_cache[..., 1],
-        ],
-        -1,
-    )
-    x_out2 = x_out2.flatten(3)
+    x_out2 = (x * cos) + (transform(x) * sin)
     return torch.cat((x_out2, x_pass), dim=-1)
 
 
@@ -494,7 +506,8 @@ class SelfAttention(torch.nn.Module):
             self.past_value = self._allocate_memory(seq_len, batch_size, device=device, dtype=dtype)
 
     def forward(
-            self, hidden_states, attention_mask, rotary_pos_emb, kv_cache=None, use_cache=True, global_seq_len=None, position_ids=None,
+            self, hidden_states, attention_mask, rotary_pos_emb, cos, sin, mask_even=None, mask_odd=None,
+            rope_mask_even=None, rope_mask_odd=None, kv_cache=None, use_cache=True, global_seq_len=None, position_ids=None,
     ):
         # hidden_states: [sq, b, h]
 
@@ -538,8 +551,10 @@ class SelfAttention(torch.nn.Module):
 
         # apply relative positional encoding (rotary embedding)
         if rotary_pos_emb is not None:
-            query_layer = apply_rotary_pos_emb(query_layer, rotary_pos_emb)
-            key_layer = apply_rotary_pos_emb(key_layer, rotary_pos_emb)
+            # query_layer = apply_rotary_pos_emb(query_layer, rotary_pos_emb)
+            # key_layer = apply_rotary_pos_emb(key_layer, rotary_pos_emb)
+            query_layer = apply_rotary_pos_emb(query_layer, cos, sin, mask_even, mask_odd, rope_mask_even, rope_mask_odd)
+            key_layer = apply_rotary_pos_emb(key_layer, cos, sin, mask_even, mask_odd, rope_mask_even, rope_mask_odd)
 
         # adjust key and value for inference
         key_layer = update(self.past_key, key_layer, 0, idx=position_ids[0])
@@ -671,7 +686,8 @@ class GLMBlock(torch.nn.Module):
         self.self_attention.allocate_kv_cache(batch_size, seq_len)
 
     def forward(
-            self, hidden_states, attention_mask, rotary_pos_emb, kv_cache=None, use_cache=True, global_seq_len=None, position_ids=None,
+            self, hidden_states, attention_mask, rotary_pos_emb, cos, sin, mask_even=None, mask_odd=None,
+            rope_mask_even=None, rope_mask_odd=None, kv_cache=None, use_cache=True, global_seq_len=None, position_ids=None,
     ):
         # hidden_states: [s, b, h]
 
@@ -682,6 +698,11 @@ class GLMBlock(torch.nn.Module):
             layernorm_output,
             attention_mask,
             rotary_pos_emb,
+            cos, sin,
+            mask_even=mask_even,
+            mask_odd=mask_odd,
+            rope_mask_even=rope_mask_even,
+            rope_mask_odd=rope_mask_odd,
             kv_cache=kv_cache,
             use_cache=use_cache,
             global_seq_len=global_seq_len,
@@ -749,7 +770,10 @@ class GLMTransformer(torch.nn.Module):
             layer.allocate_kv_cache(batch_size, seq_len)
 
     def forward(
-            self, hidden_states, attention_mask, rotary_pos_emb, kv_caches=None,
+            self, hidden_states, attention_mask, rotary_pos_emb, cos, sin,
+            mask_even=None, mask_odd=None,
+            rope_mask_even=None, rope_mask_odd=None,
+            kv_caches=None,
             use_cache: Optional[bool] = True,
             output_hidden_states: Optional[bool] = False,
             global_seq_len: Optional[bool] = None,
@@ -795,6 +819,11 @@ class GLMTransformer(torch.nn.Module):
                     hidden_states,
                     attention_mask,
                     rotary_pos_emb,
+                    cos, sin,
+                    mask_even=mask_even,
+                    mask_odd=mask_odd,
+                    rope_mask_even=rope_mask_even,
+                    rope_mask_odd=rope_mask_odd,
                     kv_cache=kv_caches[index],
                     use_cache=use_cache,
                     global_seq_len=global_seq_len,
@@ -987,11 +1016,20 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
         else:
             rotary_pos_emb = rotary_pos_emb[None, :seq_length]
         rotary_pos_emb = rotary_pos_emb.transpose(0, 1).contiguous()
+        cos = rotary_pos_emb[:, :, :, 0].repeat_interleave(2, dim=-1).unsqueeze(-2).contiguous()
+        sin = rotary_pos_emb[:, :, :, 1].repeat_interleave(2, dim=-1).unsqueeze(-2).contiguous()
+        mask_even = torch.tensor([[[1, 1], [0, 0]]], dtype=torch.bfloat16, device=cos.device).repeat(cos.shape[-1] // 2, 1, 1)
+        mask_odd = torch.tensor([[[0, 0], [1, 1]]], dtype=torch.bfloat16, device=cos.device).repeat(cos.shape[-1] // 2, 1, 1)
+        mask_even, mask_odd = torch.block_diag(*mask_even).contiguous(), torch.block_diag(*mask_odd).contiguous()
+        rope_mask_even = torch.tensor([0, 1], device=cos.device).repeat(1, cos.shape[-1] // 2).contiguous()
+        rope_mask_odd = torch.tensor([-1, 0], device=cos.device).repeat(1, cos.shape[-1] // 2).contiguous()
 
         # Run encoder.
         hidden_states, presents, all_hidden_states, all_self_attentions = self.encoder(
-            inputs_embeds, full_attention_mask, rotary_pos_emb=rotary_pos_emb,
-            kv_caches=past_key_values, use_cache=use_cache, output_hidden_states=output_hidden_states, global_seq_len=global_seq_len, position_ids=position_ids,
+            inputs_embeds, full_attention_mask, rotary_pos_emb=rotary_pos_emb, cos=cos, sin=sin,
+            mask_even=mask_even, mask_odd=mask_odd, rope_mask_even=rope_mask_even, rope_mask_odd=rope_mask_odd,
+            kv_caches=past_key_values, use_cache=use_cache, output_hidden_states=output_hidden_states,
+            global_seq_len=global_seq_len, position_ids=position_ids,
         )
 
         if not return_dict:
@@ -1086,43 +1124,63 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             is_first_forward: bool = True,
             **kwargs
     ) -> dict:
+        # input_ids = input_ids.to("hpu")
         if past_key_values == None:
             self.global_seq_len = 0
+        past_length = self.global_seq_len
         # only last token for input_ids if past is not None
         if position_ids is None:
             position_ids = self.get_position_ids(input_ids, device=input_ids.device)
         if not is_first_forward:
             position_ids = position_ids[..., -1:]
             input_ids = input_ids[:, -1:]
-        if self.config.use_cache and self.config.reuse_cache:
-            unwrap_ds(self).allocate_kv_cache(input_ids.shape[0], self.max_sequence_length)
-        past_length = self.global_seq_len
-        self.global_seq_len += input_ids.shape[1]   # global seq len in all cycles of chat
-        last_token_idx = input_ids.shape[1] - 1         # last token idx of prompt in current cycle of chat
-        global_seq_len_bulk = calculate_input_padding(self.global_seq_len, self.config.static_shapes, # bulked global seq len
-                                                      self.config.bucket_width, self.config.max_input_length) + self.global_seq_len
-        input_ids_bulk = calculate_input_padding(input_ids.shape[1], self.config.static_shapes, # bulked input seq len
-                                                 self.config.bucket_width, self.config.max_input_length) + input_ids.shape[1]
-        input_ids_padded = input_ids
-        position_ids_padded = position_ids
-        input_padding_len = input_ids_bulk - last_token_idx - 1
-        if last_token_idx > 0 and input_padding_len > 0:    #for prompt of each cycle chat
-            input_ids_padded = torch.nn.functional.pad(input_ids, (0, input_padding_len), value=self.config.pad_token_id)
-            batch_size, seq_length = input_ids_padded.shape
-            position_ids_padded = torch.arange(position_ids_padded[0][0], position_ids_padded[0][0] + seq_length, 1,
-                                               dtype=torch.long, device=input_ids_padded.device).unsqueeze(0).repeat(batch_size, 1)
-        full_attention_mask = self.get_masks(past_length, input_ids_padded, global_seq_len_bulk)
+            self.global_seq_len += 1   # global seq len in all cycles of chat
+            last_token_idx = input_ids.shape[1] - 1         # last token idx of prompt in current cycle of chat
+            global_seq_len_bulk = calculate_input_padding(self.global_seq_len, self.config.static_shapes, # bulked global seq len
+                                                          self.config.bucket_width, self.config.max_input_length) + self.global_seq_len
+            full_attention_mask = self.get_masks(past_length, input_ids, global_seq_len_bulk)
 
-        return {
-            "input_ids": input_ids_padded.to("hpu"),
-            "past_key_values": past_key_values,
-            "position_ids": position_ids_padded.to("hpu"),
-            "attention_mask": None,
-            "return_last_logit": True,
-            "global_seq_len": global_seq_len_bulk,
-            "last_token_idx": torch.tensor(last_token_idx, device="hpu"),
-            "full_attention_mask": full_attention_mask.to("hpu")
-        }
+            # print(input_ids.shape, position_ids.shape, position_ids.shape, full_attention_mask.shape)
+            return {
+                "input_ids": input_ids.to("hpu"),
+                "past_key_values": past_key_values,
+                "position_ids": position_ids.to("hpu"),
+                "attention_mask": None,
+                "return_last_logit": True,
+                "global_seq_len": global_seq_len_bulk,
+                "last_token_idx": torch.tensor(last_token_idx, device="hpu"),
+                "full_attention_mask": full_attention_mask.to("hpu")
+            }
+        else:
+            if self.config.use_cache and self.config.reuse_cache:
+                unwrap_ds(self).allocate_kv_cache(input_ids.shape[0], self.max_sequence_length)
+            self.global_seq_len += input_ids.shape[1]   # global seq len in all cycles of chat
+            last_token_idx = input_ids.shape[1] - 1         # last token idx of prompt in current cycle of chat
+            global_seq_len_bulk = calculate_input_padding(self.global_seq_len, self.config.static_shapes, # bulked global seq len
+                                                        self.config.bucket_width, self.config.max_input_length) + self.global_seq_len
+            input_ids_bulk = calculate_input_padding(input_ids.shape[1], self.config.static_shapes, # bulked input seq len
+                                                    self.config.bucket_width, self.config.max_input_length) + input_ids.shape[1]
+            input_ids_padded = input_ids
+            position_ids_padded = position_ids
+            input_padding_len = input_ids_bulk - last_token_idx - 1
+            if last_token_idx > 0 and input_padding_len > 0:    #for prompt of each cycle chat
+                input_ids_padded = torch.nn.functional.pad(input_ids, (0, input_padding_len), value=self.config.pad_token_id)
+                batch_size, seq_length = input_ids_padded.shape
+                position_ids_padded = torch.arange(position_ids_padded[0][0], position_ids_padded[0][0] + seq_length, 1,
+                                                dtype=torch.long, device=input_ids_padded.device).unsqueeze(0).repeat(batch_size, 1)
+            full_attention_mask = self.get_masks(past_length, input_ids_padded, global_seq_len_bulk)
+
+            # print(input_ids.shape, input_ids_padded.shape, position_ids.shape, position_ids_padded.shape, full_attention_mask.shape)
+            return {
+                "input_ids": input_ids_padded.to("hpu"),
+                "past_key_values": past_key_values,
+                "position_ids": position_ids_padded.to("hpu"),
+                "attention_mask": None,
+                "return_last_logit": True,
+                "global_seq_len": global_seq_len_bulk,
+                "last_token_idx": torch.tensor(last_token_idx, device="hpu"),
+                "full_attention_mask": full_attention_mask.to("hpu")
+            }
 
     def allocate_kv_cache(self, batch_size, seq_len):
         self.transformer.allocate_kv_cache(batch_size, seq_len)
@@ -1415,13 +1473,13 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )
-            unfinished_sequences = unfinished_sequences.mul((sum(next_tokens != i for i in eos_token_id)).long())
-            if return_past_key_values:
-                yield input_ids, outputs.past_key_values
-            else:
-                yield input_ids
+            # unfinished_sequences = unfinished_sequences.mul((sum(next_tokens != i for i in eos_token_id)).long())
             # stop when each sentence is finished, or if we exceed the maximum length
             if stopping_criteria(input_ids, scores):
+                if return_past_key_values:
+                    yield input_ids, outputs.past_key_values
+                else:
+                    yield input_ids
                 break
             # if PERF_PRINT:
             #     print("[ChatGLM2-6B] one token takes {:.2f} ms, input_length {}".format(
