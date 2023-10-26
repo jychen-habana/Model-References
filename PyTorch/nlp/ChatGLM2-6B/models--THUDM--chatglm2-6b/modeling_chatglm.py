@@ -69,7 +69,8 @@ def defined(v):
 
 
 def round_up(n, multiple):
-    return (n + multiple) // multiple * multiple
+    return torch.div((n + multiple), multiple, rounding_mode='floor') * multiple
+    # return (n + multiple) // multiple * multiple
 
 
 def calculate_input_padding(input_length, static_shapes=False, bucket_width=None, max_input_length=None):
@@ -1094,12 +1095,14 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
 
     def get_masks(self, past_length, input_ids, max_mask_padding):
         batch_size, seq_length = input_ids.shape
-        full_attention_mask = torch.ones(batch_size, seq_length, seq_length, device=input_ids.device)
-        full_attention_mask.tril_()
-
-        if past_length:
-            full_attention_mask = torch.cat((torch.ones(batch_size, seq_length, past_length,
-                                                        device=input_ids.device), full_attention_mask), dim=-1)
+        if not past_length:
+            full_attention_mask = torch.ones(batch_size, seq_length, seq_length, device=input_ids.device)
+            full_attention_mask.tril_()
+        else:
+            full_attention_mask = torch.ones(batch_size, seq_length, past_length + seq_length, device=input_ids.device)
+            strides, offsets = full_attention_mask.stride(), full_attention_mask.storage_offset() + past_length
+            full_attention_mask_post = torch.as_strided(full_attention_mask, (batch_size, seq_length, seq_length), strides, offsets)
+            full_attention_mask_post.tril_()
 
         mask_pad = max_mask_padding - past_length - seq_length
         if mask_pad > 0:
@@ -1107,10 +1110,6 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         if mask_pad < 0:
             full_attention_mask = full_attention_mask[..., :max_mask_padding]
 
-        # if padding_mask is not None:
-            # full_attention_mask = full_attention_mask * padding_mask.unsqueeze(1)
-        # if not past_length and padding_mask is not None:
-        #     full_attention_mask -= padding_mask.unsqueeze(1) - 1
         full_attention_mask = (full_attention_mask < 0.5).bool()
         full_attention_mask.unsqueeze_(1)
         return full_attention_mask
@@ -1120,42 +1119,46 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             input_ids: torch.LongTensor,
             past_key_values: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
+            full_attention_mask: Optional[torch.Tensor] = None,
             position_ids: Optional[torch.Tensor] = None,
             is_first_forward: bool = True,
+            last_token_idx: Optional[torch.Tensor] = None,
+            last_token_idx_host: int = None,
             **kwargs
     ) -> dict:
-        # input_ids = input_ids.to("hpu")
         if past_key_values == None:
             self.global_seq_len = 0
         past_length = self.global_seq_len
         # only last token for input_ids if past is not None
-        if position_ids is None:
-            position_ids = self.get_position_ids(input_ids, device=input_ids.device)
         if not is_first_forward:
-            position_ids = position_ids[..., -1:]
-            input_ids = input_ids[:, -1:]
+            input_ids = input_ids.index_select(-1, last_token_idx)
+            position_ids = last_token_idx.unsqueeze(0).repeat(input_ids.shape[0], 1)
+            last_token_idx.add_(1)
+            last_token_idx_host += 1
             self.global_seq_len += 1   # global seq len in all cycles of chat
-            last_token_idx = input_ids.shape[1] - 1         # last token idx of prompt in current cycle of chat
             global_seq_len_bulk = calculate_input_padding(self.global_seq_len, self.config.static_shapes, # bulked global seq len
                                                           self.config.bucket_width, self.config.max_input_length) + self.global_seq_len
-            full_attention_mask = self.get_masks(past_length, input_ids, global_seq_len_bulk)
-
-            # print(input_ids.shape, position_ids.shape, position_ids.shape, full_attention_mask.shape)
+            mask_padding = global_seq_len_bulk - full_attention_mask.shape[-1]
+            if mask_padding > 0:
+                full_attention_mask = F.pad(full_attention_mask, (0, mask_padding), value=True)
+            full_attention_mask.index_fill_(-1, torch.tensor(self.global_seq_len-1, device="hpu"), False)
             return {
-                "input_ids": input_ids.to("hpu"),
+                "input_ids": input_ids,
                 "past_key_values": past_key_values,
-                "position_ids": position_ids.to("hpu"),
+                "position_ids": position_ids,
                 "attention_mask": None,
                 "return_last_logit": True,
                 "global_seq_len": global_seq_len_bulk,
-                "last_token_idx": torch.tensor(last_token_idx, device="hpu"),
-                "full_attention_mask": full_attention_mask.to("hpu")
-            }
+                "last_token_idx": last_token_idx,
+                "full_attention_mask": full_attention_mask
+            }, is_first_forward, last_token_idx_host
         else:
             if self.config.use_cache and self.config.reuse_cache:
                 unwrap_ds(self).allocate_kv_cache(input_ids.shape[0], self.max_sequence_length)
+            if position_ids is None:
+                position_ids = self.get_position_ids(input_ids, device=input_ids.device)
             self.global_seq_len += input_ids.shape[1]   # global seq len in all cycles of chat
-            last_token_idx = input_ids.shape[1] - 1         # last token idx of prompt in current cycle of chat
+            last_token_idx_host = last_token_idx = input_ids.shape[1] - 1         # last token idx of prompt in current cycle of chat
             global_seq_len_bulk = calculate_input_padding(self.global_seq_len, self.config.static_shapes, # bulked global seq len
                                                         self.config.bucket_width, self.config.max_input_length) + self.global_seq_len
             input_ids_bulk = calculate_input_padding(input_ids.shape[1], self.config.static_shapes, # bulked input seq len
@@ -1169,8 +1172,6 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 position_ids_padded = torch.arange(position_ids_padded[0][0], position_ids_padded[0][0] + seq_length, 1,
                                                 dtype=torch.long, device=input_ids_padded.device).unsqueeze(0).repeat(batch_size, 1)
             full_attention_mask = self.get_masks(past_length, input_ids_padded, global_seq_len_bulk)
-
-            # print(input_ids.shape, input_ids_padded.shape, position_ids.shape, position_ids_padded.shape, full_attention_mask.shape)
             return {
                 "input_ids": input_ids_padded.to("hpu"),
                 "past_key_values": past_key_values,
@@ -1180,7 +1181,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 "global_seq_len": global_seq_len_bulk,
                 "last_token_idx": torch.tensor(last_token_idx, device="hpu"),
                 "full_attention_mask": full_attention_mask.to("hpu")
-            }
+            }, is_first_forward, last_token_idx_host
 
     def allocate_kv_cache(self, batch_size, seq_len):
         self.transformer.allocate_kv_cache(batch_size, seq_len)
@@ -1220,8 +1221,10 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
 
         hidden_states = transformer_outputs[0]
         if return_last_logit:
-            # hidden_states = hidden_states[-1:]
-            hidden_states = hidden_states.index_select(0, last_token_idx)
+            if hidden_states.shape[0] == 1:
+                hidden_states = hidden_states[-1:]
+            else:
+                hidden_states = hidden_states.index_select(0, last_token_idx)
         lm_logits = self.transformer.output_layer(hidden_states)
         lm_logits = lm_logits.transpose(0, 1).contiguous()
 
@@ -1445,7 +1448,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             # if PERF_PRINT:
             #     import time
             #     step_start = time.time()
-            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            model_inputs, is_first_forward, last_token_idx_host = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             # forward pass to get next token
             outputs = self(
                 **model_inputs,
@@ -1453,6 +1456,12 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 output_attentions=False,
                 output_hidden_states=False,
             )
+
+            last_token_idx = model_inputs["last_token_idx"]
+            if is_first_forward:
+                input_ids = model_inputs["input_ids"]
+                model_inputs["full_attention_mask"] = \
+                    model_inputs["full_attention_mask"].index_select(-2, last_token_idx)
 
             next_token_logits = outputs.logits[:, -1, :]
             # pre-process distribution
@@ -1467,19 +1476,27 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             else:
                 next_tokens = torch.argmax(probs, dim=-1)
 
-            next_tokens = next_tokens.cpu()
             # update generated ids, model inputs, and length for next step
-            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            # next_tokens = next_tokens.detach().cpu()
+            # input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            if last_token_idx >= input_ids.shape[-1] - 1:
+                input_padding = calculate_input_padding(input_ids.shape[-1], self.config.static_shapes,
+                                                        self.config.bucket_width, self.config.max_input_length)
+                input_ids = F.pad(input_ids, (0, input_padding), value=self.config.pad_token_id)
+            input_ids.index_copy_(1, last_token_idx, next_tokens[:, None])
+            model_kwargs["last_token_idx"] = last_token_idx
+            model_kwargs["last_token_idx_host"] = last_token_idx_host
+            model_kwargs["full_attention_mask"] = model_inputs["full_attention_mask"]
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )
             # unfinished_sequences = unfinished_sequences.mul((sum(next_tokens != i for i in eos_token_id)).long())
             # stop when each sentence is finished, or if we exceed the maximum length
-            if stopping_criteria(input_ids, scores):
+            if last_token_idx_host >= generation_config.max_length: # stopping_criteria(input_ids, scores):
                 if return_past_key_values:
-                    yield input_ids, outputs.past_key_values
+                    yield input_ids[:, :last_token_idx], outputs.past_key_values
                 else:
-                    yield input_ids
+                    yield input_ids[:, :last_token_idx]
                 break
             # if PERF_PRINT:
             #     print("[ChatGLM2-6B] one token takes {:.2f} ms, input_length {}".format(
@@ -1488,7 +1505,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         if PERF_PRINT:
             avg_step_time = (time.time() - start)*1000/max_new_tokens
             print("\n[ChatGLM2-6B] batch_size:{}, max_length:{}, avg_step_time:{:.2f} ms, tokens_per_sec:{:.2f}".format(
-                input_ids.shape[0], input_ids.shape[-1], avg_step_time, 1000/avg_step_time*input_ids.shape[0]))
+                input_ids.shape[0], last_token_idx_host, avg_step_time, 1000/avg_step_time*input_ids.shape[0]))
 
     def quantize(self, bits: int, empty_init=False, device=None, **kwargs):
         if bits == 0:
