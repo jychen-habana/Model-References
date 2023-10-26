@@ -1138,6 +1138,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             self.global_seq_len += 1   # global seq len in all cycles of chat
             global_seq_len_bulk = calculate_input_padding(self.global_seq_len, self.config.static_shapes, # bulked global seq len
                                                           self.config.bucket_width, self.config.max_input_length) + self.global_seq_len
+            global_seq_len_bulk = min(global_seq_len_bulk, 8192)
             mask_padding = global_seq_len_bulk - full_attention_mask.shape[-1]
             if mask_padding > 0:
                 full_attention_mask = F.pad(full_attention_mask, (0, mask_padding), value=True)
